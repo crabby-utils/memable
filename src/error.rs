@@ -56,6 +56,51 @@ pub enum EngineError {
         duration: Duration,
     },
 
+    /// A key component contains the `/` delimiter.
+    #[error("invalid key component ({label}): '{value}' must not contain '/'")]
+    InvalidKey {
+        /// Which component was invalid (e.g. `"workflow_name"`, `"instance_id"`, `"step_key"`).
+        label: &'static str,
+        /// The invalid value.
+        value: String,
+    },
+
+    /// The stored payload type does not match the expected type.
+    ///
+    /// This occurs when [`Engine::signal`](crate::Engine::signal) delivers a
+    /// payload of type `T` but the workflow's suspend point expects type `U`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::EngineError;
+    ///
+    /// let err = EngineError::TypeMismatch {
+    ///     key: "approval:v1".into(),
+    ///     expected: "i32".into(),
+    ///     found: "alloc::string::String".into(),
+    /// };
+    /// assert!(err.to_string().contains("type mismatch"));
+    /// ```
+    #[error("type mismatch for step '{key}': expected `{expected}`, found `{found}`")]
+    TypeMismatch {
+        /// The step key where the mismatch occurred.
+        key: String,
+        /// The type name expected by the deserializing code.
+        expected: String,
+        /// The type name found in the stored envelope.
+        found: String,
+    },
+
+    /// A signal was rejected because the target step is not suspended.
+    #[error("signal rejected for step '{key}': {reason}")]
+    SignalRejected {
+        /// The step key the signal targeted.
+        key: String,
+        /// Why the signal was rejected.
+        reason: String,
+    },
+
     /// The workflow suspended at a step, awaiting an external signal.
     #[error("workflow suspended at step '{key}'")]
     Suspended {

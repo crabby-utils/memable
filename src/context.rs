@@ -31,10 +31,84 @@ pub(crate) struct TimerEntry {
     pub step_key: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum StepData<T> {
     Completed { result: T, status: Option<String> },
     Suspended,
+}
+
+/// Storage envelope that wraps serialized [`StepData<T>`] with a type tag.
+///
+/// The type tag enables detection of payload type mismatches between
+/// [`Engine::signal`](crate::Engine::signal) and the workflow's suspend point
+/// before deserialization is attempted.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StepEnvelope {
+    /// `Some(type_name)` for `Completed` entries, `None` for `Suspended`.
+    pub type_tag: Option<String>,
+    /// Postcard-serialized `StepData<T>` bytes.
+    data: Vec<u8>,
+}
+
+/// Serialize a [`StepData<T>`] into an envelope with a type tag.
+pub(crate) fn serialize_step<T: Serialize>(
+    data: &StepData<T>,
+    key: &str,
+) -> Result<Vec<u8>, EngineError> {
+    let type_tag = match data {
+        StepData::Completed { .. } => Some(std::any::type_name::<T>().to_string()),
+        StepData::Suspended => None,
+    };
+    let inner = postcard::to_allocvec(data).map_err(|e| EngineError::Serialization {
+        key: key.to_string(),
+        source: Box::new(e),
+    })?;
+    let envelope = StepEnvelope {
+        type_tag,
+        data: inner,
+    };
+    postcard::to_allocvec(&envelope).map_err(|e| EngineError::Serialization {
+        key: key.to_string(),
+        source: Box::new(e),
+    })
+}
+
+/// Deserialize a [`StepData<T>`] from an envelope, validating the type tag.
+///
+/// Returns [`EngineError::TypeMismatch`] if the stored type tag does not
+/// match `std::any::type_name::<T>()`. Suspended entries have no type tag
+/// and always succeed.
+pub(crate) fn deserialize_step<T: DeserializeOwned>(
+    bytes: &[u8],
+    key: &str,
+) -> Result<StepData<T>, EngineError> {
+    let envelope: StepEnvelope =
+        postcard::from_bytes(bytes).map_err(|e| EngineError::Serialization {
+            key: key.to_string(),
+            source: Box::new(e),
+        })?;
+    if let Some(ref stored) = envelope.type_tag {
+        let expected = std::any::type_name::<T>();
+        if stored != expected {
+            return Err(EngineError::TypeMismatch {
+                key: key.to_string(),
+                expected: expected.to_string(),
+                found: stored.clone(),
+            });
+        }
+    }
+    postcard::from_bytes(&envelope.data).map_err(|e| EngineError::Serialization {
+        key: key.to_string(),
+        source: Box::new(e),
+    })
+}
+
+/// Deserialize only the [`StepEnvelope`] without parsing the inner payload.
+pub(crate) fn deserialize_envelope(bytes: &[u8], key: &str) -> Result<StepEnvelope, EngineError> {
+    postcard::from_bytes(bytes).map_err(|e| EngineError::Serialization {
+        key: key.to_string(),
+        source: Box::new(e),
+    })
 }
 
 /// Workflow execution context.
@@ -172,6 +246,10 @@ impl Context {
     /// the closure runs, its result is serialized with postcard, persisted
     /// to redb, and returned.
     ///
+    /// # Panics
+    ///
+    /// Panics if `key` contains the `/` delimiter.
+    ///
     /// # Examples
     ///
     /// ```
@@ -204,6 +282,7 @@ impl Context {
     /// ```
     #[must_use]
     pub fn step<'a>(&'a self, key: &'a str) -> StepBuilder<'a> {
+        assert!(!key.contains('/'), "step key must not contain '/': '{key}'");
         StepBuilder {
             ctx: self,
             key,
@@ -224,6 +303,10 @@ impl Context {
     ///
     /// Use [`.status()`](SuspendBuilder::status) to set a custom status
     /// message (defaults to the step key).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` contains the `/` delimiter.
     ///
     /// # Errors
     ///
@@ -250,6 +333,10 @@ impl Context {
     where
         T: Serialize + DeserializeOwned + Send,
     {
+        assert!(
+            !key.contains('/'),
+            "suspend key must not contain '/': '{key}'"
+        );
         SuspendBuilder {
             ctx: self,
             key,
@@ -270,6 +357,7 @@ impl Context {
     ///
     /// # Errors
     ///
+    /// Returns [`EngineError::InvalidKey`] if `key` contains `/`.
     /// Returns [`EngineError::Suspended`] when the timer is first set.
     /// Returns [`EngineError::Storage`] or [`EngineError::Serialization`]
     /// on storage failures.
@@ -292,16 +380,18 @@ impl Context {
     /// }
     /// ```
     pub fn timer(&self, key: &str, duration: Duration) -> Result<(), EngineError> {
+        if key.contains('/') {
+            return Err(EngineError::InvalidKey {
+                label: "step_key",
+                value: key.to_string(),
+            });
+        }
         let composite_key = format!("{}/{}/{key}", self.workflow_name, self.instance_id);
         let span = info_span!("timer", key, composite_key = %composite_key);
 
         // Check for completed entry (timer already fired and signalled).
         if let Some(bytes) = self.read_step(&composite_key)? {
-            let data: StepData<()> =
-                postcard::from_bytes(&bytes).map_err(|e| EngineError::Serialization {
-                    key: key.to_string(),
-                    source: Box::new(e),
-                })?;
+            let data: StepData<()> = deserialize_step(&bytes, key)?;
             match data {
                 StepData::Completed { .. } => {
                     span.in_scope(|| info!("timer already fired — resuming"));
@@ -325,10 +415,7 @@ impl Context {
 
         // Write Suspended entry to step table.
         let data = StepData::<()>::Suspended;
-        let bytes = postcard::to_allocvec(&data).map_err(|e| EngineError::Serialization {
-            key: key.to_string(),
-            source: Box::new(e),
-        })?;
+        let bytes = serialize_step(&data, key)?;
         self.write_step(&composite_key, &bytes)?;
 
         // Write timer entry.
@@ -367,11 +454,7 @@ impl Context {
         let span = info_span!("suspend", key, composite_key = %composite_key);
 
         if let Some(bytes) = self.read_step(&composite_key)? {
-            let data: StepData<T> =
-                postcard::from_bytes(&bytes).map_err(|e| EngineError::Serialization {
-                    key: key.to_string(),
-                    source: Box::new(e),
-                })?;
+            let data: StepData<T> = deserialize_step(&bytes, key)?;
             match data {
                 StepData::Completed { result, status } => {
                     span.in_scope(|| info!("signal received — resuming"));
@@ -395,10 +478,7 @@ impl Context {
 
         // Cache miss — write Suspended entry and short-circuit.
         let data = StepData::<T>::Suspended;
-        let bytes = postcard::to_allocvec(&data).map_err(|e| EngineError::Serialization {
-            key: key.to_string(),
-            source: Box::new(e),
-        })?;
+        let bytes = serialize_step(&data, key)?;
         self.write_step(&composite_key, &bytes)?;
 
         let msg = status_msg.unwrap_or(key).to_string();
@@ -622,11 +702,7 @@ impl StepBuilder<'_> {
         // Check for cached result.
         if let Some(bytes) = self.ctx.read_step(&composite_key)? {
             span.in_scope(|| info!("cache hit"));
-            let data: StepData<T> =
-                postcard::from_bytes(&bytes).map_err(|e| EngineError::Serialization {
-                    key: self.key.to_string(),
-                    source: Box::new(e),
-                })?;
+            let data: StepData<T> = deserialize_step(&bytes, self.key)?;
             match data {
                 StepData::Completed { result, status } => {
                     if let Some(status) = status {
@@ -672,10 +748,7 @@ impl StepBuilder<'_> {
             result,
             status: self.ctx.current_status_string(),
         };
-        let bytes = postcard::to_allocvec(&data).map_err(|e| EngineError::Serialization {
-            key: self.key.to_string(),
-            source: Box::new(e),
-        })?;
+        let bytes = serialize_step(&data, self.key)?;
         let StepData::Completed { result, .. } = data else {
             unreachable!()
         };

@@ -16,7 +16,10 @@ use tracing::{error, info, info_span};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::context::{Context, STEPS, StepData, TIMERS, TimerEntry};
+use crate::context::{
+    Context, STEPS, StepData, StepEnvelope, TIMERS, TimerEntry, deserialize_envelope,
+    serialize_step,
+};
 use crate::error::EngineError;
 use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 
@@ -237,6 +240,16 @@ type WorkflowFn = Arc<
 
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn validate_key_component(value: &str, label: &'static str) -> Result<(), EngineError> {
+    if value.contains('/') {
+        return Err(EngineError::InvalidKey {
+            label,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn generate_instance_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -397,7 +410,8 @@ impl Engine {
     ///
     /// # Panics
     ///
-    /// Panics if the engine has already been started.
+    /// Panics if the engine has already been started, or if `name`
+    /// contains the `/` delimiter.
     ///
     /// # Examples
     ///
@@ -420,6 +434,10 @@ impl Engine {
             "cannot register workflows after the engine has started"
         );
         let name = name.into();
+        assert!(
+            !name.contains('/'),
+            "workflow name must not contain '/': '{name}'"
+        );
         info!(name, "registered workflow");
         self.workflows
             .insert(name, Arc::new(move |ctx| Box::pin(workflow(ctx))));
@@ -476,8 +494,9 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`EngineError::NotStarted`] if the engine has not been started,
-    /// or [`EngineError::WorkflowNotFound`] if no workflow is registered
-    /// under the given name.
+    /// [`EngineError::WorkflowNotFound`] if no workflow is registered
+    /// under the given name, or [`EngineError::InvalidKey`] if the name
+    /// contains `/`.
     ///
     /// # Examples
     ///
@@ -500,6 +519,7 @@ impl Engine {
     ) -> Result<Invocation, EngineError> {
         let instance_id = generate_instance_id();
         let workflow_name = workflow_name.into();
+        validate_key_component(&workflow_name, "workflow_name")?;
         self.spawn_workflow(&workflow_name, instance_id).await
     }
 
@@ -512,8 +532,9 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`EngineError::NotStarted`] if the engine has not been started,
-    /// or [`EngineError::WorkflowNotFound`] if no workflow is registered
-    /// under the given name.
+    /// [`EngineError::WorkflowNotFound`] if no workflow is registered
+    /// under the given name, or [`EngineError::InvalidKey`] if `workflow_name`
+    /// or `instance_id` contains `/`.
     ///
     /// # Examples
     ///
@@ -539,6 +560,8 @@ impl Engine {
     ) -> Result<Invocation, EngineError> {
         let workflow_name = workflow_name.into();
         let instance_id = instance_id.into();
+        validate_key_component(&workflow_name, "workflow_name")?;
+        validate_key_component(&instance_id, "instance_id")?;
         self.spawn_workflow(&workflow_name, instance_id).await
     }
 
@@ -552,8 +575,10 @@ impl Engine {
     ///
     /// Returns [`EngineError::NotStarted`] if the engine has not been started,
     /// [`EngineError::WorkflowNotFound`] if no workflow is registered under
-    /// the given name, or [`EngineError::Storage`] / [`EngineError::Serialization`]
-    /// if the write fails.
+    /// the given name, [`EngineError::InvalidKey`] if any component contains
+    /// `/`, [`EngineError::SignalRejected`] if the step does not exist or is
+    /// not currently suspended, or [`EngineError::Storage`] /
+    /// [`EngineError::Serialization`] if the write fails.
     ///
     /// # Examples
     ///
@@ -590,15 +615,18 @@ impl Engine {
     where
         T: Serialize + DeserializeOwned + Send,
     {
+        validate_key_component(workflow_name, "workflow_name")?;
+        validate_key_component(instance_id, "instance_id")?;
+        validate_key_component(step_key, "step_key")?;
         let composite_key = format!("{workflow_name}/{instance_id}/{step_key}");
+
+        verify_step_is_suspended(&self.db, &composite_key, step_key)?;
+
         let data: StepData<T> = StepData::Completed {
             result: payload,
             status: None,
         };
-        let bytes = postcard::to_allocvec(&data).map_err(|e| EngineError::Serialization {
-            key: step_key.to_string(),
-            source: Box::new(e),
-        })?;
+        let bytes = serialize_step(&data, step_key)?;
 
         let write_txn = self.db.begin_write()?;
         {
@@ -912,6 +940,40 @@ fn collect_expired_timers(
     Ok(expired)
 }
 
+fn verify_step_is_suspended(
+    db: &Database,
+    composite_key: &str,
+    step_key: &str,
+) -> Result<(), EngineError> {
+    let read_txn = db.begin_read()?;
+    let table = match read_txn.open_table(STEPS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(EngineError::SignalRejected {
+                key: step_key.to_string(),
+                reason: "step does not exist".to_string(),
+            });
+        }
+        Err(e) => return Err(EngineError::from(e)),
+    };
+    match table.get(composite_key)? {
+        None => Err(EngineError::SignalRejected {
+            key: step_key.to_string(),
+            reason: "step does not exist".to_string(),
+        }),
+        Some(guard) => {
+            let envelope: StepEnvelope = deserialize_envelope(guard.value(), step_key)?;
+            match envelope.type_tag {
+                None => Ok(()),
+                Some(_) => Err(EngineError::SignalRejected {
+                    key: step_key.to_string(),
+                    reason: "step is already completed".to_string(),
+                }),
+            }
+        }
+    }
+}
+
 fn signal_timer(
     db: &Arc<Database>,
     workflows: &HashMap<String, WorkflowFn>,
@@ -923,14 +985,14 @@ fn signal_timer(
         "{}/{}/{}",
         entry.workflow_name, entry.instance_id, entry.step_key
     );
+
+    verify_step_is_suspended(db, &composite_key, &entry.step_key)?;
+
     let data: StepData<()> = StepData::Completed {
         result: (),
         status: None,
     };
-    let bytes = postcard::to_allocvec(&data).map_err(|e| EngineError::Serialization {
-        key: entry.step_key.clone(),
-        source: Box::new(e),
-    })?;
+    let bytes = serialize_step(&data, &entry.step_key)?;
     let write_txn = db.begin_write()?;
     {
         let mut table = write_txn.open_table(STEPS)?;
@@ -1022,6 +1084,7 @@ mod tests {
 
     use super::*;
     use crate::StepError;
+    use crate::context::SuspendBuilder;
 
     fn test_engine() -> Engine {
         Engine::builder().in_memory().build()
@@ -2113,5 +2176,362 @@ mod tests {
 
         let state = engine.invoke("wf").await.unwrap().wait().await;
         assert_eq!(state, WorkflowState::Completed);
+    }
+
+    // --- Key validation (S1) tests ---
+
+    #[test]
+    #[should_panic(expected = "workflow name must not contain '/'")]
+    fn register_rejects_slash_in_name() {
+        let mut engine = test_engine();
+        engine.register("bad/name", |_ctx: Context| async { Ok(()) });
+    }
+
+    #[tokio::test]
+    async fn invoke_rejects_slash_in_name() {
+        async fn wf(_ctx: Context) -> Result<(), EngineError> {
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let Err(err) = engine.invoke("bad/name").await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "workflow_name",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_slash_in_workflow_name() {
+        async fn wf(_ctx: Context) -> Result<(), EngineError> {
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let Err(err) = engine.resume("bad/name", "id-1").await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "workflow_name",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_slash_in_instance_id() {
+        async fn wf(_ctx: Context) -> Result<(), EngineError> {
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let Err(err) = engine.resume("wf", "bad/id").await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "instance_id",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_slash_in_any_component() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("wait:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        let Err(err) = engine.signal("bad/name", &id, "wait:v1", true).await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "workflow_name",
+                ..
+            }
+        ));
+
+        let Err(err) = engine.signal("wf", "bad/id", "wait:v1", true).await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "instance_id",
+                ..
+            }
+        ));
+
+        let Err(err) = engine.signal("wf", &id, "bad/key", true).await else {
+            panic!("expected InvalidKey error");
+        };
+        assert!(matches!(
+            err,
+            EngineError::InvalidKey {
+                label: "step_key",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "step key must not contain '/'")]
+    fn step_rejects_slash_in_key() {
+        let db = Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
+        let (tx, _rx) = watch::channel(WorkflowState::Started);
+        let ctx = Context::new(
+            "wf".into(),
+            "id".into(),
+            db,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let _ = ctx.step("bad/key");
+    }
+
+    #[test]
+    #[should_panic(expected = "suspend key must not contain '/'")]
+    fn suspend_rejects_slash_in_key() {
+        let db = Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
+        let (tx, _rx) = watch::channel(WorkflowState::Started);
+        let ctx = Context::new(
+            "wf".into(),
+            "id".into(),
+            db,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let _: SuspendBuilder<'_, bool> = ctx.suspend("bad/key");
+    }
+
+    #[tokio::test]
+    async fn timer_rejects_slash_in_key() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            ctx.timer("bad/key", Duration::from_secs(1))?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert!(matches!(state, WorkflowState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_when_step_does_not_exist() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("wait:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        let Err(err) = engine.signal("wf", &id, "wrong-key:v1", true).await else {
+            panic!("expected SignalRejected error");
+        };
+        assert!(
+            matches!(err, EngineError::SignalRejected { ref key, .. } if key == "wrong-key:v1"),
+            "expected SignalRejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_already_completed_step() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("gate:v1").await?;
+            let _: bool = ctx.suspend("gate2:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // First signal succeeds — step is Suspended.
+        let inv = engine.signal("wf", &id, "gate:v1", true).await.unwrap();
+        inv.wait().await;
+
+        // Second signal to same step fails — it's now Completed.
+        let Err(err) = engine.signal("wf", &id, "gate:v1", true).await else {
+            panic!("expected SignalRejected error");
+        };
+        assert!(
+            matches!(err, EngineError::SignalRejected { ref key, ref reason } if key == "gate:v1" && reason.contains("already completed")),
+            "expected SignalRejected for completed step, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_pre_completing_future_step() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("first:v1").await?;
+            let _: String = ctx.suspend("second:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Attempt to signal a step the workflow hasn't reached yet.
+        let Err(err) = engine
+            .signal("wf", &id, "second:v1", "sneaky".to_string())
+            .await
+        else {
+            panic!("expected SignalRejected error");
+        };
+        assert!(
+            matches!(err, EngineError::SignalRejected { ref key, .. } if key == "second:v1"),
+            "expected SignalRejected for future step, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_type_mismatch_returns_error() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: i32 = ctx.suspend("gate:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Signal with String instead of the expected i32.
+        let inv = engine
+            .signal("wf", &id, "gate:v1", "wrong type".to_string())
+            .await
+            .unwrap();
+        let state = inv.wait().await;
+        assert!(
+            matches!(state, WorkflowState::Failed(ref msg) if msg.contains("type mismatch")),
+            "expected TypeMismatch failure, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_type_mismatch_caught_for_binary_compatible_types() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: i32 = ctx.suspend("gate:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Signal with u32 instead of i32 — same binary layout, different type name.
+        let inv = engine.signal("wf", &id, "gate:v1", 42_u32).await.unwrap();
+        let state = inv.wait().await;
+        assert!(
+            matches!(state, WorkflowState::Failed(ref msg) if msg.contains("type mismatch")),
+            "expected TypeMismatch failure for u32 vs i32, got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serialize_deserialize_step_round_trip() {
+        use crate::context::{StepData, deserialize_step, serialize_step};
+
+        // Completed round-trip.
+        let data: StepData<String> = StepData::Completed {
+            result: "hello".to_string(),
+            status: Some("done".to_string()),
+        };
+        let bytes = serialize_step(&data, "test-key").unwrap();
+        let recovered: StepData<String> = deserialize_step(&bytes, "test-key").unwrap();
+        match recovered {
+            StepData::Completed { result, status } => {
+                assert_eq!(result, "hello");
+                assert_eq!(status.as_deref(), Some("done"));
+            }
+            StepData::Suspended => panic!("expected Completed"),
+        }
+
+        // Suspended round-trip.
+        let data = StepData::<u64>::Suspended;
+        let bytes = serialize_step(&data, "test-key").unwrap();
+        let recovered: StepData<u64> = deserialize_step(&bytes, "test-key").unwrap();
+        assert!(matches!(recovered, StepData::Suspended));
+    }
+
+    #[tokio::test]
+    async fn type_mismatch_error_contains_type_names() {
+        use crate::context::{StepData, deserialize_step, serialize_step};
+
+        let data: StepData<String> = StepData::Completed {
+            result: "hello".to_string(),
+            status: None,
+        };
+        let bytes = serialize_step(&data, "k").unwrap();
+
+        let err = deserialize_step::<i32>(&bytes, "k").unwrap_err();
+        match err {
+            EngineError::TypeMismatch {
+                key,
+                expected,
+                found,
+            } => {
+                assert_eq!(key, "k");
+                assert!(
+                    expected.contains("i32"),
+                    "expected contains i32, got {expected}"
+                );
+                assert!(
+                    found.contains("String"),
+                    "found contains String, got {found}"
+                );
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 }
