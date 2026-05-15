@@ -11,7 +11,7 @@ use std::time::Duration;
 /// ```
 /// use memable::EngineError;
 ///
-/// let err = EngineError::step_failed("my-step", "connection reset");
+/// let err = EngineError::step_failed("my-step", "connection reset", false);
 /// assert!(err.to_string().contains("my-step"));
 /// ```
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +37,8 @@ pub enum EngineError {
         key: String,
         /// The underlying error from the step closure.
         source: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether the original error was marked as retryable.
+        retryable: bool,
     },
 
     /// The engine has not been started.
@@ -125,6 +127,36 @@ pub enum EngineError {
         key: String,
     },
 
+    /// A regular step found a `Suspended` entry in the step table.
+    ///
+    /// This means the step key was previously used as a suspend or timer
+    /// point, and the workflow code has since changed to use the same key
+    /// for a regular step. The engine refuses to silently re-execute the
+    /// step because it would bypass the original suspend gate.
+    ///
+    /// To resolve this, either:
+    /// - Use a new step key (e.g. `"review:v2"`) in the updated workflow
+    /// - Drain or signal suspended instances before deploying the change
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::EngineError;
+    ///
+    /// let err = EngineError::SuspendedStepConflict {
+    ///     key: "approval:v1".into(),
+    /// };
+    /// assert!(err.to_string().contains("suspended entry"));
+    /// ```
+    #[error(
+        "step '{key}' has a suspended entry but was called as a regular step \
+         — the workflow code likely changed while an instance was suspended"
+    )]
+    SuspendedStepConflict {
+        /// The step key with the conflicting entry.
+        key: String,
+    },
+
     /// The workflow suspended at a step, awaiting an external signal.
     #[error("workflow suspended at step '{key}'")]
     Suspended {
@@ -141,16 +173,18 @@ impl EngineError {
     /// ```
     /// use memable::EngineError;
     ///
-    /// let err = EngineError::step_failed("my-step", "boom");
+    /// let err = EngineError::step_failed("my-step", "boom", false);
     /// assert!(matches!(err, EngineError::StepFailed { .. }));
     /// ```
     pub fn step_failed(
         key: impl Into<String>,
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+        retryable: bool,
     ) -> Self {
         Self::StepFailed {
             key: key.into(),
             source: source.into(),
+            retryable,
         }
     }
 }

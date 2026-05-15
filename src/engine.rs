@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{BuildHasher as _, RandomState};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -238,8 +239,6 @@ type WorkflowFn = Arc<
     dyn Fn(Context) -> Pin<Box<dyn Future<Output = Result<(), EngineError>> + Send>> + Send + Sync,
 >;
 
-static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 fn validate_key_component(value: &str, label: &'static str) -> Result<(), EngineError> {
     if value.contains('/') {
         return Err(EngineError::InvalidKey {
@@ -255,8 +254,8 @@ fn generate_instance_id() -> String {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis();
-    let n = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{ts}-{n}")
+    let rand: u64 = RandomState::new().hash_one(ts);
+    format!("{ts}-{rand:x}")
 }
 
 /// Builder for configuring and constructing an [`Engine`].
@@ -445,7 +444,9 @@ impl Engine {
 
     /// Starts the engine, allowing workflow invocations.
     ///
-    /// Spawns a background timer poller that fires expired durable timers.
+    /// Spawns a background timer poller that checks for expired durable
+    /// timers every second. Timer deadlines have millisecond precision, but
+    /// actual firing latency is up to ~1 second after the deadline.
     /// Must be called after all workflows are registered.
     ///
     /// # Errors
@@ -816,11 +817,14 @@ impl Engine {
     }
 }
 
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs()
+fn now_unix_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_millis(),
+    )
+    .expect("system clock overflows u64 millis")
 }
 
 fn handle_workflow_result(
@@ -987,7 +991,7 @@ async fn poll_timers(
     timer_serial: &Arc<AtomicU64>,
     tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
 ) -> Result<(), EngineError> {
-    let now = now_unix_secs();
+    let now = now_unix_millis();
     let expired = collect_expired_timers(db, now)?;
 
     for (key, entry) in expired {
@@ -1742,6 +1746,42 @@ mod tests {
         // Resume without signal — should still be suspended.
         let state = engine.resume("wf", &id).await.unwrap().wait().await;
         assert_eq!(state, WorkflowState::Suspended("wait:v1".into()));
+    }
+
+    #[tokio::test]
+    async fn step_rejects_suspended_entry() {
+        let use_step = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let use_step2 = Arc::clone(&use_step);
+
+        let wf = move |ctx: Context| {
+            let use_step = Arc::clone(&use_step2);
+            async move {
+                if use_step.load(Ordering::Acquire) {
+                    let _: String = ctx.step("action:v1").run(async || Ok("x".into())).await?;
+                } else {
+                    let _: String = ctx.suspend("action:v1").await?;
+                }
+                Ok(())
+            }
+        };
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        // V1: workflow suspends at "action:v1".
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        let state = inv.wait().await;
+        assert_eq!(state, WorkflowState::Suspended("action:v1".into()));
+
+        // V2: same key is now a regular step.
+        use_step.store(true, Ordering::Release);
+        let state = engine.resume("wf", &id).await.unwrap().wait().await;
+        assert!(
+            matches!(state, WorkflowState::Failed(ref msg) if msg.contains("suspended entry")),
+            "expected SuspendedStepConflict, got: {state:?}"
+        );
     }
 
     #[tokio::test]

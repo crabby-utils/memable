@@ -20,7 +20,7 @@ use crate::error::{EngineError, StepError};
 pub(crate) const STEPS: TableDefinition<&str, &[u8]> = TableDefinition::new("steps");
 
 /// redb table for pending timers.
-/// Key: `(deadline_unix_secs, serial)`, Value: postcard-serialized [`TimerEntry`].
+/// Key: `(deadline_unix_millis, serial)`, Value: postcard-serialized [`TimerEntry`].
 pub(crate) const TIMERS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("timers");
 
 /// Value stored in the timer table.
@@ -349,8 +349,10 @@ impl Context {
     ///
     /// On first execution, writes a `Suspended` entry to the step table
     /// and a row to the timer table, then returns [`EngineError::Suspended`].
-    /// A background poller in the [`Engine`](crate::Engine) detects the
-    /// expired timer and automatically signals the workflow to resume.
+    /// Deadlines are stored with millisecond precision. A background poller
+    /// in the [`Engine`](crate::Engine) checks every second for expired
+    /// timers, so actual wake-up latency is up to ~1 second after the
+    /// deadline.
     ///
     /// On replay (after the timer has fired), the step finds its completed
     /// entry and returns immediately.
@@ -407,33 +409,36 @@ impl Context {
         }
 
         // First execution — compute absolute deadline.
-        let deadline = SystemTime::now()
+        let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
-            .as_secs()
-            + duration.as_secs();
+            .as_millis();
+        let deadline = u64::try_from(now_ms).expect("system clock overflows u64 millis")
+            + u64::try_from(duration.as_millis()).expect("duration overflows u64 millis");
 
-        // Write Suspended entry to step table.
+        // Serialize step and timer data, then write both in a single transaction
+        // so a crash can't leave a Suspended step with no timer to wake it.
         let data = StepData::<()>::Suspended;
-        let bytes = serialize_step(&data, key)?;
-        self.write_step(&composite_key, &bytes)?;
+        let step_bytes = serialize_step(&data, key)?;
 
-        // Write timer entry.
         let serial = self.timer_serial.fetch_add(1, Ordering::Relaxed);
         let entry = TimerEntry {
             workflow_name: self.workflow_name.clone(),
             instance_id: self.instance_id.clone(),
             step_key: key.to_string(),
         };
-        let entry_bytes =
+        let timer_bytes =
             postcard::to_allocvec(&entry).map_err(|e| EngineError::Serialization {
                 key: key.to_string(),
                 source: Box::new(e),
             })?;
+
         let write_txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(TIMERS)?;
-            table.insert((deadline, serial), entry_bytes.as_slice())?;
+            let mut steps = write_txn.open_table(STEPS)?;
+            steps.insert(composite_key.as_str(), step_bytes.as_slice())?;
+            let mut timers = write_txn.open_table(TIMERS)?;
+            timers.insert((deadline, serial), timer_bytes.as_slice())?;
         }
         write_txn.commit()?;
 
@@ -714,8 +719,8 @@ impl StepBuilder<'_> {
                     return Ok(result);
                 }
                 StepData::Suspended => {
-                    span.in_scope(|| {
-                        info!("found suspended entry in step table — unexpected");
+                    return Err(EngineError::SuspendedStepConflict {
+                        key: self.key.to_string(),
                     });
                 }
             }
@@ -736,10 +741,16 @@ impl StepBuilder<'_> {
         } else {
             f().await
         };
-        let result = step_result.map_err(|e| EngineError::StepFailed {
-            key: self.key.to_string(),
-            source: match e {
-                StepError::Retryable(inner) | StepError::Permanent(inner) => inner,
+        let result = step_result.map_err(|e| match e {
+            StepError::Retryable(inner) => EngineError::StepFailed {
+                key: self.key.to_string(),
+                source: inner,
+                retryable: true,
+            },
+            StepError::Permanent(inner) => EngineError::StepFailed {
+                key: self.key.to_string(),
+                source: inner,
+                retryable: false,
             },
         })?;
 

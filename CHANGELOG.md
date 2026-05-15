@@ -17,3 +17,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Engine::register()` panics if the workflow name contains `/`.
 - `Context::step()` and `Context::suspend()` panic if the key contains `/`.
 - `Engine::invoke()`, `Engine::resume()`, `Engine::signal()`, and `Context::timer()` return `EngineError::InvalidKey` if any key component contains `/`.
+- `EngineError::StepFailed` now includes a `retryable: bool` field, preserving whether the original `StepError` was `Retryable` or `Permanent`.
+- `EngineError::step_failed()` constructor takes an additional `retryable: bool` parameter.
