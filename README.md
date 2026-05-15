@@ -1,27 +1,45 @@
 # memable
 
+[![Crates.io](https://img.shields.io/crates/v/memable.svg)](https://crates.io/crates/memable)
+[![Documentation](https://docs.rs/memable/badge.svg)](https://docs.rs/memable)
+[![CI](https://github.com/crabby-utils/memable/actions/workflows/ci.yml/badge.svg)](https://github.com/crabby-utils/memable/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/memable.svg)](https://crates.io/crates/memable)
+
 An embeddable durable execution engine for Rust.
 
-Unlike platforms such as Temporal or Restate, memable is a **library** — it runs
-inside your process with zero external dependencies. Workflows recover via
-**key-based memoisation** rather than positional replay, so you can deploy new
-code, fix bugs, and selectively re-execute steps without breaking in-flight
-workflows.
+Platforms like Temporal and Restate are powerful, but they're platforms. They
+bring their own runtime, their own infrastructure, their own opinions about how
+you deploy. memable takes a different approach: it's a **library**. It runs
+inside your process with no external dependencies.
 
-## Target domains
+Workflows recover through **key-based memoisation** rather than positional
+replay. That means you can deploy new code, fix bugs, and selectively re-execute
+steps without breaking in-flight workflows.
 
-- **Data integration & sync pipelines** — reliable multistep ETL with automatic
+## Installation
+
+```sh
+cargo add memable
+```
+
+## What's it for?
+
+- **Data integration and sync pipelines**. Reliable multistep ETL with automatic
   retry and checkpointing.
-- **AI agentic workflows** — durable orchestration of LLM calls, tool use, and
+- **AI agentic workflows**. Durable orchestration of LLM calls, tool use, and
   branching agent logic.
+
+## Documentation
+
+[API docs on docs.rs](https://docs.rs/memable/0.1.0/memable/)
 
 ## Status
 
-Early development — the public API is not yet stable.
+Early development. The public API is not yet stable.
 
 ## Minimum Supported Rust Version
 
-The MSRV is **1.85** (Rust 2024 edition).
+1.85 (Rust 2024 edition).
 
 ## License
 
