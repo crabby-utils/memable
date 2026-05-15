@@ -87,10 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(state, WorkflowState::Completed);
 
     // The fetch step ran twice total (timed out + retry).
-    println!(
-        "Fetch attempts: {}",
-        FETCH_ATTEMPTS.load(Ordering::Relaxed)
-    );
+    println!("Fetch attempts: {}", FETCH_ATTEMPTS.load(Ordering::Relaxed));
 
     engine.stop().await;
     println!();
