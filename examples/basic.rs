@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Metadata: {} at {:?}", meta.status(), meta.completed_at());
     println!();
 
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Resume the same instance — step 1 is memoised, step 2 retries.
     println!("=== Resume (step 1 memoised, step 2 retries) ===");
