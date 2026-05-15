@@ -1,0 +1,38 @@
+[package]
+name = "memable"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "An embeddable durable execution engine using key-based memoisation"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/crabby-utils/memable"
+readme = "README.md"
+keywords = ["durable-execution", "workflow", "memoisation", "orchestration"]
+categories = ["asynchronous"]
+exclude = [".github/", "deny.toml"]
+
+[dependencies]
+postcard = { version = "1", features = ["alloc"] }
+redb = "4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+allow_attributes = "warn"
+clone_on_ref_ptr = "warn"
+create_dir = "warn"
+exit = "warn"
+unused_result_ok = "warn"
+unused_trait_names = "warn"
