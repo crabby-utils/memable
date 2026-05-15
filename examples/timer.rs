@@ -31,7 +31,7 @@ async fn pipeline_with_cooldown(ctx: Context) -> Result<(), EngineError> {
     // returns its memoised result without re-executing.
     let _processed: u32 = ctx
         .step("process-batch:v1")
-        .run(async || {
+        .run(async move || {
             println!("  [step] processing {batch_size} records");
             Ok(batch_size)
         })

@@ -23,6 +23,7 @@ use crate::context::{
 };
 use crate::error::EngineError;
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
+use crate::retry::RetryPolicy;
 
 /// Observable state of a workflow instance.
 ///
@@ -269,6 +270,7 @@ fn generate_instance_id() -> String {
 /// ```
 pub struct EngineBuilder {
     db: Option<Database>,
+    default_retry: Option<RetryPolicy>,
 }
 
 impl EngineBuilder {
@@ -318,6 +320,29 @@ impl EngineBuilder {
         Ok(self)
     }
 
+    /// Sets a default retry policy for all steps.
+    ///
+    /// Individual steps can override this with
+    /// [`StepBuilder::retry`](crate::StepBuilder::retry) or disable it
+    /// with [`StepBuilder::no_retry`](crate::StepBuilder::no_retry).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::{Engine, RetryPolicy};
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .default_retry(RetryPolicy::exponential(3, Duration::from_secs(1)))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn default_retry(mut self, policy: RetryPolicy) -> Self {
+        self.default_retry = Some(policy);
+        self
+    }
+
     /// Builds the engine.
     ///
     /// # Panics
@@ -335,6 +360,7 @@ impl EngineBuilder {
             running: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
             timer_serial: Arc::new(AtomicU64::new(0)),
+            default_retry: self.default_retry,
         }
     }
 }
@@ -384,6 +410,7 @@ pub struct Engine {
     running: Arc<AtomicBool>,
     tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     timer_serial: Arc<AtomicU64>,
+    default_retry: Option<RetryPolicy>,
 }
 
 impl Engine {
@@ -398,7 +425,10 @@ impl Engine {
     /// ```
     #[must_use]
     pub fn builder() -> EngineBuilder {
-        EngineBuilder { db: None }
+        EngineBuilder {
+            db: None,
+            default_retry: None,
+        }
     }
 
     /// Registers a workflow definition by name.
@@ -468,13 +498,21 @@ impl Engine {
         let workflows = self.workflows.clone();
         let timer_serial = Arc::clone(&self.timer_serial);
         let poller_tasks = Arc::clone(&self.tasks);
+        let default_retry = self.default_retry.clone();
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(
             async move {
                 info!("timer poller started");
                 while running.load(Ordering::Acquire) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Err(e) = poll_timers(&db, &workflows, &timer_serial, &poller_tasks).await
+                    if let Err(e) = poll_timers(
+                        &db,
+                        &workflows,
+                        &timer_serial,
+                        &poller_tasks,
+                        default_retry.as_ref(),
+                    )
+                    .await
                     {
                         error!(error = %e, "timer poll failed");
                     }
@@ -656,6 +694,7 @@ impl Engine {
             workflow_name,
             instance_id,
             &self.timer_serial,
+            self.default_retry.clone(),
         ))
     }
 
@@ -813,6 +852,7 @@ impl Engine {
             workflow_name,
             &instance_id,
             &self.timer_serial,
+            self.default_retry.clone(),
         ))
     }
 }
@@ -883,6 +923,7 @@ fn spawn_workflow_task(
     workflow_name: &str,
     instance_id: &str,
     timer_serial: &Arc<AtomicU64>,
+    default_retry: Option<RetryPolicy>,
 ) -> Invocation {
     let workflow = Arc::clone(workflow);
     let (tx, rx) = watch::channel(WorkflowState::Started);
@@ -893,6 +934,7 @@ fn spawn_workflow_task(
         Arc::clone(&db),
         tx.clone(),
         Arc::clone(timer_serial),
+        default_retry,
     );
 
     let wf_name = workflow_name.to_string();
@@ -990,6 +1032,7 @@ async fn poll_timers(
     workflows: &HashMap<String, WorkflowFn>,
     timer_serial: &Arc<AtomicU64>,
     tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    default_retry: Option<&RetryPolicy>,
 ) -> Result<(), EngineError> {
     let now = now_unix_millis();
     let expired = collect_expired_timers(db, now)?;
@@ -1024,7 +1067,7 @@ async fn poll_timers(
             "timer expired — signalling"
         );
 
-        match signal_timer(db, workflows, timer_serial, tasks, &entry).await {
+        match signal_timer(db, workflows, timer_serial, tasks, &entry, default_retry).await {
             Ok(()) => {}
             Err(EngineError::SignalSuperseded { ref key }) => {
                 info!(
@@ -1074,6 +1117,7 @@ async fn signal_timer(
     timer_serial: &Arc<AtomicU64>,
     tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
     entry: &TimerEntry,
+    default_retry: Option<&RetryPolicy>,
 ) -> Result<(), EngineError> {
     let data: StepData<()> = StepData::Completed {
         result: (),
@@ -1101,6 +1145,7 @@ async fn signal_timer(
         &entry.workflow_name,
         &entry.instance_id,
         timer_serial,
+        default_retry.cloned(),
     );
 
     Ok(())
@@ -1148,16 +1193,17 @@ mod tests {
             let c = Arc::clone(&c);
             let a = Arc::clone(&a);
             async move {
+                let c2 = Arc::clone(&c);
                 let _: String = ctx
                     .step("s1")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c2.fetch_add(1, Ordering::Relaxed);
                         Ok("hello".to_string())
                     })
                     .await?;
                 let _: String = ctx
                     .step("s2")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("transient"));
@@ -1218,7 +1264,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("x")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
@@ -1267,7 +1313,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("x")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
@@ -1322,10 +1368,11 @@ mod tests {
             let a = Arc::clone(&a);
             async move {
                 ctx.set_status("step-one");
+                let c2 = Arc::clone(&c);
                 let _: String = ctx
                     .step("s1")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c2.fetch_add(1, Ordering::Relaxed);
                         Ok("one".to_string())
                     })
                     .await?;
@@ -1333,7 +1380,7 @@ mod tests {
                 ctx.set_status("step-two");
                 let _: String = ctx
                     .step("s2")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("transient"));
@@ -1382,7 +1429,7 @@ mod tests {
                 ctx.set_status("phase-2");
                 let _: i32 = ctx
                     .step("s2")
-                    .run(async || {
+                    .run(async move || {
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("fail first time"));
                         }
@@ -1484,7 +1531,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
+                    .run(async move || {
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("transient"));
                         }
@@ -1690,17 +1737,18 @@ mod tests {
         engine.register("wf", move |ctx: Context| {
             let c = Arc::clone(&c);
             async move {
+                let c2 = Arc::clone(&c);
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c2.fetch_add(1, Ordering::Relaxed);
                         Ok(42)
                     })
                     .await?;
                 let _: String = ctx.suspend("gate:v1").await?;
                 let _: i32 = ctx
                     .step("s2")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(99)
                     })
@@ -1832,7 +1880,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
+                    .run(async move || {
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("transient"));
                         }
@@ -1877,7 +1925,7 @@ mod tests {
                 // No set_status call — status should be None in the record.
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(42)
                     })
@@ -1912,17 +1960,18 @@ mod tests {
         engine.register("timer-wf", move |ctx: Context| {
             let c = Arc::clone(&c);
             async move {
+                let c2 = Arc::clone(&c);
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c2.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
                     .await?;
                 ctx.timer("wait:v1", Duration::ZERO)?;
                 let _: i32 = ctx
                     .step("s2")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(2)
                     })
@@ -1967,7 +2016,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
@@ -2012,7 +2061,7 @@ mod tests {
             async move {
                 let _: i32 = ctx
                     .step("s1")
-                    .run(async || {
+                    .run(async move || {
                         if a.fetch_add(1, Ordering::Relaxed) == 0 {
                             return Err(StepError::retryable("transient"));
                         }
@@ -2057,25 +2106,27 @@ mod tests {
         engine.register("multi-timer", move |ctx: Context| {
             let c = Arc::clone(&c);
             async move {
+                let c2 = Arc::clone(&c);
                 let _: i32 = ctx
                     .step("before")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c2.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
                     .await?;
                 ctx.timer("t1:v1", Duration::ZERO)?;
+                let c3 = Arc::clone(&c);
                 let _: i32 = ctx
                     .step("between")
-                    .run(async || {
-                        c.fetch_add(1, Ordering::Relaxed);
+                    .run(async move || {
+                        c3.fetch_add(1, Ordering::Relaxed);
                         Ok(2)
                     })
                     .await?;
                 ctx.timer("t2:v1", Duration::ZERO)?;
                 let _: i32 = ctx
                     .step("after")
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(3)
                     })
@@ -2162,7 +2213,7 @@ mod tests {
                 let _: i32 = ctx
                     .step("flaky")
                     .timeout(Duration::from_millis(100))
-                    .run(async || {
+                    .run(async move || {
                         let n = a.fetch_add(1, Ordering::Relaxed);
                         if n == 0 {
                             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -2199,7 +2250,7 @@ mod tests {
                 let _: i32 = ctx
                     .step("s1")
                     .timeout(Duration::from_nanos(1))
-                    .run(async || {
+                    .run(async move || {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(1)
                     })
@@ -2225,10 +2276,11 @@ mod tests {
     async fn timeout_with_borrowing_closure() {
         async fn wf(ctx: Context) -> Result<(), EngineError> {
             let local_data = String::from("borrowed");
+            let local_data_clone = local_data.clone();
             let v: String = ctx
                 .step("borrow")
                 .timeout(Duration::from_secs(5))
-                .run(async || Ok(local_data.clone()))
+                .run(async move || Ok(local_data_clone.clone()))
                 .await?;
             assert_eq!(v, "borrowed");
             assert_eq!(local_data, "borrowed");
@@ -2378,6 +2430,7 @@ mod tests {
             db,
             tx,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
         let _ = ctx.step("bad/key");
     }
@@ -2397,6 +2450,7 @@ mod tests {
             db,
             tx,
             Arc::new(AtomicU64::new(0)),
+            None,
         );
         let _: SuspendBuilder<'_, bool> = ctx.suspend("bad/key");
     }
@@ -2559,7 +2613,7 @@ mod tests {
                 assert_eq!(result, "hello");
                 assert_eq!(status.as_deref(), Some("done"));
             }
-            StepData::Suspended => panic!("expected Completed"),
+            StepData::Suspended | StepData::Failed { .. } => panic!("expected Completed"),
         }
 
         // Suspended round-trip.
@@ -2710,6 +2764,337 @@ mod tests {
             COUNTER.load(Ordering::Relaxed),
             1,
             "timer-resumed workflow tracked by wait_all"
+        );
+    }
+
+    // ── Retry tests ──────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_error_retries_then_exhausts() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::fixed(2, Duration::from_millis(10)))
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::retryable("boom"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("3 attempts")));
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_error_skips_retry() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::fixed(3, Duration::from_millis(10)))
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::permanent("fatal"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("fatal")));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn step_succeeds_on_second_attempt() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let v: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::fixed(3, Duration::from_millis(10)))
+                    .run(async move || {
+                        if a.fetch_add(1, Ordering::Relaxed) == 0 {
+                            return Err(StepError::retryable("transient"));
+                        }
+                        Ok(42)
+                    })
+                    .await?;
+                assert_eq!(v, 42);
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert_eq!(state, WorkflowState::Completed);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exponential_backoff_delays() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::exponential(3, Duration::from_secs(1)))
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::retryable("fail"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        engine.invoke("wf").await.unwrap().wait().await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        // 1s + 2s + 4s = 7s total backoff
+        assert!(elapsed >= Duration::from_secs(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn engine_default_retry_applies() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = Engine::builder()
+            .in_memory()
+            .default_retry(crate::RetryPolicy::fixed(2, Duration::from_millis(10)))
+            .build();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::retryable("boom"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        engine.invoke("wf").await.unwrap().wait().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn per_step_retry_overrides_default() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = Engine::builder()
+            .in_memory()
+            .default_retry(crate::RetryPolicy::fixed(5, Duration::from_millis(10)))
+            .build();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::fixed(1, Duration::from_millis(10)))
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::retryable("boom"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        engine.invoke("wf").await.unwrap().wait().await;
+        // Per-step policy: 1 retry = 2 total attempts (not 6 from the default).
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_retry_overrides_default() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = Engine::builder()
+            .in_memory()
+            .default_retry(crate::RetryPolicy::fixed(3, Duration::from_millis(10)))
+            .build();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .no_retry()
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Err(StepError::retryable("boom"))
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        engine.invoke("wf").await.unwrap().wait().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_letter_persisted_and_resume_re_executes() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .retry(crate::RetryPolicy::fixed(1, Duration::from_millis(10)))
+                    .run(async move || {
+                        let n = a.fetch_add(1, Ordering::Relaxed);
+                        if n < 4 {
+                            return Err(StepError::retryable("not yet"));
+                        }
+                        Ok(100)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        // First invoke: 2 attempts (1 + 1 retry), both fail → RetriesExhausted.
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        let state = inv.wait().await;
+        assert!(matches!(state, WorkflowState::Failed(_)));
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+        // Resume: fresh retry budget, 2 more attempts, both fail again.
+        let state = engine.resume("wf", &id).await.unwrap().wait().await;
+        assert!(matches!(state, WorkflowState::Failed(_)));
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+
+        // Resume again: first attempt succeeds (n=4 >= 4).
+        let state = engine.resume("wf", &id).await.unwrap().wait().await;
+        assert_eq!(state, WorkflowState::Completed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_applies_per_attempt() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .timeout(Duration::from_millis(50))
+                    .retry(crate::RetryPolicy::fixed(2, Duration::from_millis(10)))
+                    .run(async move || {
+                        let n = a.fetch_add(1, Ordering::Relaxed);
+                        if n == 0 {
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                        Ok(1)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        // First attempt times out (StepTimeout propagates immediately,
+        // bypassing retry). Timeout is not retried.
+        assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("timed out")));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn memoised_step_skips_retry() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = Arc::clone(&attempts);
+
+        let mut engine = Engine::builder()
+            .in_memory()
+            .default_retry(crate::RetryPolicy::fixed(3, Duration::from_millis(1)))
+            .build();
+        engine.register("wf", move |ctx: Context| {
+            let a = Arc::clone(&a);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .run(async move || {
+                        a.fetch_add(1, Ordering::Relaxed);
+                        Ok(1)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Resume — s1 is memoised, closure should NOT run again.
+        engine.resume("wf", &id).await.unwrap().wait().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retryable_without_policy_behaves_like_step_failed() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let _: i32 = ctx
+                .step("s1")
+                .run(async || Err(StepError::retryable("boom")))
+                .await?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        // No retry policy → StepFailed (not RetriesExhausted).
+        assert!(
+            matches!(state, WorkflowState::Failed(msg) if msg.contains("boom") && !msg.contains("attempts"))
         );
     }
 }

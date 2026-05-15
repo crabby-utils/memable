@@ -28,28 +28,27 @@ async fn fetch_from_upstream() -> Result<String, StepError> {
 }
 
 /// A workflow that fetches data with a timeout, then processes it.
-/// The closure borrows `pipeline_name` from the workflow scope —
-/// no `'static` required even with a timeout set.
+/// Uses `pipeline_name` across steps — no `'static` required even
+/// with a timeout set.
 async fn resilient_pipeline(ctx: Context) -> Result<(), EngineError> {
     let pipeline_name = String::from("customer-sync");
 
     // This step has a 500ms timeout. On the first invocation the
     // simulated upstream hangs, causing a StepTimeout failure. On
     // resume it re-executes (nothing was persisted) and succeeds.
+    let pn = pipeline_name.clone();
     let data: String = ctx
         .step("fetch:v1")
         .timeout(Duration::from_millis(500))
-        .run(async || {
-            // Borrows from the workflow scope — proves no 'static needed.
-            println!("  [step] fetching data for '{pipeline_name}'");
+        .run(async move || {
+            println!("  [step] fetching data for '{pn}'");
             fetch_from_upstream().await
         })
         .await?;
 
-    // A normal step without a timeout.
     let result: String = ctx
         .step("process:v1")
-        .run(async || {
+        .run(async move || {
             println!("  [step] processing: {data}");
             Ok(format!("{pipeline_name}: done"))
         })

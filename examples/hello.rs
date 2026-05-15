@@ -8,7 +8,7 @@ async fn greet(ctx: Context) -> Result<(), EngineError> {
 
     let message: String = ctx
         .step("format-greeting:v1")
-        .run(async || Ok(format!("Hello, {name}!")))
+        .run(async move || Ok(format!("Hello, {name}!")))
         .await?;
 
     println!("{message}");

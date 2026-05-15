@@ -14,6 +14,7 @@ use tracing::{info, info_span};
 
 use crate::engine::WorkflowState;
 use crate::error::{EngineError, StepError};
+use crate::retry::RetryPolicy;
 
 /// redb table for step results.
 /// Key: `"{workflow_name}/{instance_id}/{step_key}"`, Value: postcard-serialized bytes.
@@ -31,10 +32,17 @@ pub(crate) struct TimerEntry {
     pub step_key: String,
 }
 
+#[derive(Debug, Clone)]
+enum RetryOverride {
+    Disabled,
+    Custom(RetryPolicy),
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) enum StepData<T> {
     Completed { result: T, status: Option<String> },
     Suspended,
+    Failed { error: String },
 }
 
 /// Storage envelope that wraps serialized [`StepData<T>`] with a type tag.
@@ -57,7 +65,7 @@ pub(crate) fn serialize_step<T: Serialize>(
 ) -> Result<Vec<u8>, EngineError> {
     let type_tag = match data {
         StepData::Completed { .. } => Some(std::any::type_name::<T>().to_string()),
-        StepData::Suspended => None,
+        StepData::Suspended | StepData::Failed { .. } => None,
     };
     let inner = postcard::to_allocvec(data).map_err(|e| EngineError::Serialization {
         key: key.to_string(),
@@ -125,6 +133,7 @@ pub struct Context {
     status_tx: watch::Sender<WorkflowState>,
     replaying: AtomicBool,
     timer_serial: Arc<AtomicU64>,
+    default_retry: Option<RetryPolicy>,
 }
 
 impl Context {
@@ -134,6 +143,7 @@ impl Context {
         db: Arc<Database>,
         status_tx: watch::Sender<WorkflowState>,
         timer_serial: Arc<AtomicU64>,
+        default_retry: Option<RetryPolicy>,
     ) -> Self {
         Self {
             workflow_name,
@@ -142,6 +152,7 @@ impl Context {
             status_tx,
             replaying: AtomicBool::new(true),
             timer_serial,
+            default_retry,
         }
     }
 
@@ -265,11 +276,12 @@ impl Context {
     ///     }).await?;
     ///     assert_eq!(value, "Hello, world!");
     ///
-    ///     // Step with timeout — closure can still borrow from scope.
+    ///     // Step with timeout — clone data for the closure.
+    ///     let value_clone = value.clone();
     ///     let loud: String = ctx.step("shout:v1")
     ///         .timeout(std::time::Duration::from_secs(5))
-    ///         .run(async || {
-    ///             Ok(value.to_uppercase())
+    ///         .run(async move || {
+    ///             Ok(value_clone.to_uppercase())
     ///         }).await?;
     ///     assert_eq!(loud, "HELLO, WORLD!");
     ///     Ok(())
@@ -287,6 +299,7 @@ impl Context {
             ctx: self,
             key,
             timeout: None,
+            retry_override: None,
         }
     }
 
@@ -405,6 +418,9 @@ impl Context {
                         key: key.to_string(),
                     });
                 }
+                StepData::Failed { .. } => {
+                    // Dead-lettered — treat as cache miss for re-execution.
+                }
             }
         }
 
@@ -477,6 +493,9 @@ impl Context {
                     return Err(EngineError::Suspended {
                         key: key.to_string(),
                     });
+                }
+                StepData::Failed { .. } => {
+                    // Dead-lettered — treat as cache miss for re-execution.
                 }
             }
         }
@@ -612,11 +631,12 @@ where
 ///         Ok("data".to_string())
 ///     }).await?;
 ///
-///     // Step with timeout — closure can borrow from scope.
+///     // Step with timeout — clone data for the closure.
+///     let v_clone = v.clone();
 ///     let processed: String = ctx.step("process:v1")
 ///         .timeout(Duration::from_secs(30))
-///         .run(async || {
-///             Ok(v.to_uppercase())
+///         .run(async move || {
+///             Ok(v_clone.to_uppercase())
 ///         }).await?;
 ///     Ok(())
 /// }
@@ -625,6 +645,7 @@ pub struct StepBuilder<'a> {
     ctx: &'a Context,
     key: &'a str,
     timeout: Option<Duration>,
+    retry_override: Option<RetryOverride>,
 }
 
 impl StepBuilder<'_> {
@@ -658,6 +679,60 @@ impl StepBuilder<'_> {
         self
     }
 
+    /// Sets a per-step retry policy, overriding any engine-level default.
+    ///
+    /// When the closure returns [`StepError::Retryable`], the engine
+    /// retries according to this policy. Permanent errors are never retried.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::time::Duration;
+    /// # use memable::{Context, EngineError, RetryPolicy};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let v: String = ctx.step("fetch:v1")
+    ///     .retry(RetryPolicy::exponential(3, Duration::from_secs(1)))
+    ///     .run(async || {
+    ///         Ok("data".to_string())
+    ///     }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry_override = Some(RetryOverride::Custom(policy));
+        self
+    }
+
+    /// Disables retry for this step, overriding any engine-level default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let v: i32 = ctx.step("once:v1")
+    ///     .no_retry()
+    ///     .run(async || Ok(42))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn no_retry(mut self) -> Self {
+        self.retry_override = Some(RetryOverride::Disabled);
+        self
+    }
+
+    /// Resolves the effective retry policy: per-step override > engine default > none.
+    fn effective_retry(&self) -> Option<&RetryPolicy> {
+        match &self.retry_override {
+            Some(RetryOverride::Disabled) => None,
+            Some(RetryOverride::Custom(policy)) => Some(policy),
+            None => self.ctx.default_retry.as_ref(),
+        }
+    }
+
     /// Executes the step with the given closure.
     ///
     /// If a cached result exists for this step key, it is returned
@@ -665,12 +740,23 @@ impl StepBuilder<'_> {
     /// (subject to any configured [`timeout`](StepBuilder::timeout)),
     /// and its result is persisted.
     ///
+    /// When a [`RetryPolicy`] is active (via [`retry`](StepBuilder::retry)
+    /// or [`EngineBuilder::default_retry`](crate::EngineBuilder::default_retry)),
+    /// [`StepError::Retryable`] errors are retried with backoff.
+    /// [`StepError::Permanent`] errors fail immediately.
+    ///
+    /// The closure must satisfy `AsyncFnMut` (not `AsyncFnOnce`) so it can
+    /// be called multiple times during retry. Closures that capture from
+    /// the workflow scope need `async move ||` with owned values — clone
+    /// shared state (e.g. `Arc`) before each closure.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] if:
     /// - A storage operation fails ([`EngineError::Storage`])
     /// - Serialization or deserialization fails ([`EngineError::Serialization`])
-    /// - The step closure returns an error ([`EngineError::StepFailed`])
+    /// - The step closure returns a permanent error ([`EngineError::StepFailed`])
+    /// - All retry attempts are exhausted ([`EngineError::RetriesExhausted`])
     /// - The step exceeds its timeout ([`EngineError::StepTimeout`])
     ///
     /// # Examples
@@ -693,9 +779,10 @@ impl StepBuilder<'_> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn run<F, T>(self, f: F) -> Result<T, EngineError>
+    #[expect(clippy::too_many_lines)]
+    pub async fn run<F, T>(self, mut f: F) -> Result<T, EngineError>
     where
-        F: AsyncFnOnce() -> Result<T, StepError> + Send,
+        F: AsyncFnMut() -> Result<T, StepError> + Send,
         T: Serialize + DeserializeOwned + Send,
     {
         let composite_key = format!(
@@ -723,49 +810,102 @@ impl StepBuilder<'_> {
                         key: self.key.to_string(),
                     });
                 }
+                StepData::Failed { .. } => {
+                    span.in_scope(|| info!("dead-letter found — re-executing"));
+                }
             }
         }
 
-        // First cache miss — replay is over.
+        // Cache miss (or dead-letter cleared) — replay is over.
         self.ctx.replaying.store(false, Ordering::Release);
 
-        // Cache miss — execute the step closure (with optional timeout).
-        span.in_scope(|| info!("cache miss — executing"));
-        let step_result = if let Some(duration) = self.timeout {
-            tokio::time::timeout(duration, f())
-                .await
-                .map_err(|_| EngineError::StepTimeout {
-                    key: self.key.to_string(),
-                    duration,
-                })?
-        } else {
-            f().await
-        };
-        let result = step_result.map_err(|e| match e {
-            StepError::Retryable(inner) => EngineError::StepFailed {
-                key: self.key.to_string(),
-                source: inner,
-                retryable: true,
-            },
-            StepError::Permanent(inner) => EngineError::StepFailed {
-                key: self.key.to_string(),
-                source: inner,
-                retryable: false,
-            },
-        })?;
+        let max_retries = self.effective_retry().map_or(0, |p| p.max_retries);
+        let total_attempts = max_retries + 1;
 
-        // Serialize and persist the result with current status.
-        let data = StepData::Completed {
-            result,
-            status: self.ctx.current_status_string(),
-        };
-        let bytes = serialize_step(&data, self.key)?;
-        let StepData::Completed { result, .. } = data else {
-            unreachable!()
-        };
-        self.ctx.write_step(&composite_key, &bytes)?;
-        span.in_scope(|| info!("persisted"));
+        for attempt in 0..total_attempts {
+            span.in_scope(|| {
+                if attempt > 0 {
+                    tracing::warn!(attempt = attempt + 1, max = total_attempts, "retrying step");
+                } else {
+                    info!("executing");
+                }
+            });
 
-        Ok(result)
+            let step_result = if let Some(duration) = self.timeout {
+                tokio::time::timeout(duration, f())
+                    .await
+                    .map_err(|_| EngineError::StepTimeout {
+                        key: self.key.to_string(),
+                        duration,
+                    })?
+            } else {
+                f().await
+            };
+
+            match step_result {
+                Ok(result) => {
+                    let data = StepData::Completed {
+                        result,
+                        status: self.ctx.current_status_string(),
+                    };
+                    let bytes = serialize_step(&data, self.key)?;
+                    let StepData::Completed { result, .. } = data else {
+                        unreachable!()
+                    };
+                    self.ctx.write_step(&composite_key, &bytes)?;
+                    span.in_scope(|| info!("persisted"));
+                    return Ok(result);
+                }
+                Err(StepError::Permanent(inner)) => {
+                    let failed = StepData::<T>::Failed {
+                        error: inner.to_string(),
+                    };
+                    let bytes = serialize_step(&failed, self.key)?;
+                    self.ctx.write_step(&composite_key, &bytes)?;
+                    return Err(EngineError::StepFailed {
+                        key: self.key.to_string(),
+                        source: inner,
+                        retryable: false,
+                    });
+                }
+                Err(StepError::Retryable(inner)) => {
+                    let is_last = attempt + 1 >= total_attempts;
+                    if is_last {
+                        let failed = StepData::<T>::Failed {
+                            error: inner.to_string(),
+                        };
+                        let bytes = serialize_step(&failed, self.key)?;
+                        self.ctx.write_step(&composite_key, &bytes)?;
+                        if max_retries == 0 {
+                            return Err(EngineError::StepFailed {
+                                key: self.key.to_string(),
+                                source: inner,
+                                retryable: true,
+                            });
+                        }
+                        return Err(EngineError::RetriesExhausted {
+                            key: self.key.to_string(),
+                            attempts: total_attempts,
+                            source: inner,
+                        });
+                    }
+                    if let Some(policy) = self.effective_retry() {
+                        let delay = policy.delay_for(attempt);
+                        span.in_scope(|| {
+                            tracing::warn!(
+                                attempt = attempt + 1,
+                                max = total_attempts,
+                                error = %inner,
+                                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                "retryable error — backing off"
+                            );
+                        });
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        unreachable!("loop should return before exhausting iterations")
     }
 }

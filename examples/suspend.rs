@@ -38,7 +38,7 @@ async fn approval_workflow(ctx: Context) -> Result<(), EngineError> {
     // Step 2: only runs after the signal delivers `true`.
     let _processed: u32 = ctx
         .step("process-data:v1")
-        .run(async || {
+        .run(async move || {
             println!("  [step] processing {record_count} approved records");
             Ok(record_count)
         })

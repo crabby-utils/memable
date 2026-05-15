@@ -157,6 +157,31 @@ pub enum EngineError {
         key: String,
     },
 
+    /// All retry attempts for a step were exhausted.
+    ///
+    /// The step's last error is preserved as the [`source`](std::error::Error::source).
+    /// The failed result is persisted as a dead-letter entry. Calling
+    /// [`Engine::resume`](crate::Engine::resume) re-attempts the step with
+    /// a fresh retry budget.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::EngineError;
+    ///
+    /// let err = EngineError::retries_exhausted("fetch:v1", 3, "connection refused");
+    /// assert!(err.to_string().contains("3 attempts"));
+    /// ```
+    #[error("step '{key}' failed after {attempts} attempts: {source}")]
+    RetriesExhausted {
+        /// The step key that exhausted its retries.
+        key: String,
+        /// Total number of attempts (initial + retries).
+        attempts: u32,
+        /// The last error from the step closure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// The workflow suspended at a step, awaiting an external signal.
     #[error("workflow suspended at step '{key}'")]
     Suspended {
@@ -185,6 +210,28 @@ impl EngineError {
             key: key.into(),
             source: source.into(),
             retryable,
+        }
+    }
+
+    /// Creates a [`RetriesExhausted`](EngineError::RetriesExhausted) error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::EngineError;
+    ///
+    /// let err = EngineError::retries_exhausted("fetch:v1", 3, "timeout");
+    /// assert!(matches!(err, EngineError::RetriesExhausted { .. }));
+    /// ```
+    pub fn retries_exhausted(
+        key: impl Into<String>,
+        attempts: u32,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::RetriesExhausted {
+            key: key.into(),
+            attempts,
+            source: source.into(),
         }
     }
 }
@@ -222,10 +269,10 @@ impl From<redb::CommitError> for EngineError {
 /// Error returned by step closures.
 ///
 /// The variant communicates retry intent to the engine:
-/// - [`Retryable`](StepError::Retryable) — transient failure (retry support
-///   is planned but not yet implemented).
+/// - [`Retryable`](StepError::Retryable) — transient failure that the engine
+///   will retry according to the step's [`RetryPolicy`](crate::RetryPolicy).
 /// - [`Permanent`](StepError::Permanent) — unrecoverable failure, propagated
-///   immediately.
+///   immediately without retrying.
 ///
 /// There is intentionally no blanket [`From`] implementation. Callers must
 /// choose explicitly whether a given error is retryable or permanent.

@@ -17,7 +17,7 @@ async fn greeting_workflow(ctx: Context) -> Result<(), EngineError> {
 
     let greeting: String = ctx
         .step("format-greeting:v1")
-        .run(async || {
+        .run(async move || {
             STEP_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
             if FORMAT_ATTEMPTS.fetch_add(1, Ordering::Relaxed) == 0 {
                 println!("  [step] formatting greeting — transient failure!");
