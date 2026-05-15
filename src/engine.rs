@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::backends::InMemoryBackend;
-use redb::{Database, ReadableDatabase as _};
+use redb::{Database, ReadableDatabase as _, ReadableTable as _};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
@@ -21,7 +21,7 @@ use crate::context::{
     serialize_step,
 };
 use crate::error::EngineError;
-use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
+use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 
 /// Observable state of a workflow instance.
 ///
@@ -334,7 +334,7 @@ impl EngineBuilder {
             db: Arc::new(db),
             workflows: HashMap::new(),
             running: Arc::new(AtomicBool::new(false)),
-            tasks: tokio::sync::Mutex::new(JoinSet::new()),
+            tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
             timer_serial: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -383,7 +383,7 @@ pub struct Engine {
     db: Arc<Database>,
     workflows: HashMap<String, WorkflowFn>,
     running: Arc<AtomicBool>,
-    tasks: tokio::sync::Mutex<JoinSet<()>>,
+    tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     timer_serial: Arc<AtomicU64>,
 }
 
@@ -466,13 +466,15 @@ impl Engine {
         let running = Arc::clone(&self.running);
         let workflows = self.workflows.clone();
         let timer_serial = Arc::clone(&self.timer_serial);
+        let poller_tasks = Arc::clone(&self.tasks);
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(
             async move {
                 info!("timer poller started");
                 while running.load(Ordering::Acquire) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Err(e) = poll_timers(&db, &workflows, &timer_serial) {
+                    if let Err(e) = poll_timers(&db, &workflows, &timer_serial, &poller_tasks).await
+                    {
                         error!(error = %e, "timer poll failed");
                     }
                 }
@@ -577,7 +579,8 @@ impl Engine {
     /// [`EngineError::WorkflowNotFound`] if no workflow is registered under
     /// the given name, [`EngineError::InvalidKey`] if any component contains
     /// `/`, [`EngineError::SignalRejected`] if the step does not exist or is
-    /// not currently suspended, or [`EngineError::Storage`] /
+    /// not currently suspended, [`EngineError::SignalSuperseded`] if another
+    /// caller already claimed the step, or [`EngineError::Storage`] /
     /// [`EngineError::Serialization`] if the write fails.
     ///
     /// # Examples
@@ -618,22 +621,14 @@ impl Engine {
         validate_key_component(workflow_name, "workflow_name")?;
         validate_key_component(instance_id, "instance_id")?;
         validate_key_component(step_key, "step_key")?;
-        let composite_key = format!("{workflow_name}/{instance_id}/{step_key}");
-
-        verify_step_is_suspended(&self.db, &composite_key, step_key)?;
 
         let data: StepData<T> = StepData::Completed {
             result: payload,
             status: None,
         };
-        let bytes = serialize_step(&data, step_key)?;
+        let step_bytes = serialize_step(&data, step_key)?;
 
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(STEPS)?;
-            table.insert(composite_key.as_str(), bytes.as_slice())?;
-        }
-        write_txn.commit()?;
+        claim_suspended_step(&self.db, workflow_name, instance_id, step_key, &step_bytes)?;
 
         info!(
             workflow = workflow_name,
@@ -641,7 +636,26 @@ impl Engine {
             step = step_key,
             "signal delivered"
         );
-        self.resume(workflow_name, instance_id).await
+
+        let mut tasks = self.tasks.lock().await;
+
+        if !self.running.load(Ordering::Acquire) {
+            return Err(EngineError::NotStarted);
+        }
+
+        let workflow = self
+            .workflows
+            .get(workflow_name)
+            .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
+
+        Ok(spawn_workflow_task(
+            &mut tasks,
+            workflow,
+            &self.db,
+            workflow_name,
+            instance_id,
+            &self.timer_serial,
+        ))
     }
 
     /// Returns the metadata for a specific workflow instance.
@@ -784,79 +798,21 @@ impl Engine {
             .get(workflow_name)
             .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
 
-        let workflow = Arc::clone(workflow);
-        let (tx, rx) = watch::channel(WorkflowState::Started);
-        let db = Arc::clone(&self.db);
-        let ctx = Context::new(
-            workflow_name.to_string(),
-            instance_id.clone(),
-            Arc::clone(&db),
-            tx.clone(),
-            Arc::clone(&self.timer_serial),
-        );
-
         metadata::write_metadata(
-            &db,
+            &self.db,
             workflow_name,
             &instance_id,
             &WorkflowMetadata::new(MetadataStatus::Running),
         )?;
 
-        let wf_name = workflow_name.to_string();
-        let inst_id = instance_id.clone();
-        let span = info_span!("workflow", name = workflow_name, instance = %instance_id);
-
-        tasks.spawn(
-            async move {
-                info!("executing");
-                match workflow(ctx).await {
-                    Ok(()) => {
-                        info!("completed");
-                        if let Err(e) = metadata::write_metadata(
-                            &db,
-                            &wf_name,
-                            &inst_id,
-                            &WorkflowMetadata::new(MetadataStatus::Completed),
-                        ) {
-                            error!(error = %e, "failed to write completion metadata");
-                        }
-                        let _ = tx.send(WorkflowState::Completed);
-                    }
-                    Err(EngineError::Suspended { ref key }) => {
-                        let status = tx.borrow().message().unwrap_or(key).to_string();
-                        info!(key, status, "suspended");
-                        if let Err(e) = metadata::write_metadata(
-                            &db,
-                            &wf_name,
-                            &inst_id,
-                            &WorkflowMetadata::new(MetadataStatus::Suspended(status.clone())),
-                        ) {
-                            error!(error = %e, "failed to write suspension metadata");
-                        }
-                        let _ = tx.send(WorkflowState::Suspended(status));
-                    }
-                    Err(e) => {
-                        info!(error = %e, "failed");
-                        let msg = e.to_string();
-                        if let Err(me) = metadata::write_metadata(
-                            &db,
-                            &wf_name,
-                            &inst_id,
-                            &WorkflowMetadata::new(MetadataStatus::Failed(msg.clone())),
-                        ) {
-                            error!(error = %me, "failed to write failure metadata");
-                        }
-                        let _ = tx.send(WorkflowState::Failed(msg));
-                    }
-                }
-            }
-            .instrument(span),
-        );
-
-        Ok(Invocation {
-            instance_id,
-            status: rx,
-        })
+        Ok(spawn_workflow_task(
+            &mut tasks,
+            workflow,
+            &self.db,
+            workflow_name,
+            &instance_id,
+            &self.timer_serial,
+        ))
     }
 }
 
@@ -867,17 +823,174 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Scans the timer table for expired entries and signals their workflows.
-fn poll_timers(
+fn handle_workflow_result(
+    result: Result<(), EngineError>,
+    db: &Database,
+    workflow_name: &str,
+    instance_id: &str,
+    tx: &watch::Sender<WorkflowState>,
+) {
+    match result {
+        Ok(()) => {
+            info!("completed");
+            if let Err(e) = metadata::write_metadata(
+                db,
+                workflow_name,
+                instance_id,
+                &WorkflowMetadata::new(MetadataStatus::Completed),
+            ) {
+                error!(error = %e, "failed to write completion metadata");
+            }
+            let _ = tx.send(WorkflowState::Completed);
+        }
+        Err(EngineError::Suspended { ref key }) => {
+            let status = tx.borrow().message().unwrap_or(key).to_string();
+            info!(key, status, "suspended");
+            if let Err(e) = metadata::write_metadata(
+                db,
+                workflow_name,
+                instance_id,
+                &WorkflowMetadata::new(MetadataStatus::Suspended(status.clone())),
+            ) {
+                error!(error = %e, "failed to write suspension metadata");
+            }
+            let _ = tx.send(WorkflowState::Suspended(status));
+        }
+        Err(e) => {
+            info!(error = %e, "failed");
+            let msg = e.to_string();
+            if let Err(me) = metadata::write_metadata(
+                db,
+                workflow_name,
+                instance_id,
+                &WorkflowMetadata::new(MetadataStatus::Failed(msg.clone())),
+            ) {
+                error!(error = %me, "failed to write failure metadata");
+            }
+            let _ = tx.send(WorkflowState::Failed(msg));
+        }
+    }
+}
+
+fn spawn_workflow_task(
+    tasks: &mut JoinSet<()>,
+    workflow: &WorkflowFn,
+    db: &Arc<Database>,
+    workflow_name: &str,
+    instance_id: &str,
+    timer_serial: &Arc<AtomicU64>,
+) -> Invocation {
+    let workflow = Arc::clone(workflow);
+    let (tx, rx) = watch::channel(WorkflowState::Started);
+    let db = Arc::clone(db);
+    let ctx = Context::new(
+        workflow_name.to_string(),
+        instance_id.to_string(),
+        Arc::clone(&db),
+        tx.clone(),
+        Arc::clone(timer_serial),
+    );
+
+    let wf_name = workflow_name.to_string();
+    let inst_id = instance_id.to_string();
+    let span = info_span!("workflow", name = %wf_name, instance = %inst_id);
+
+    tasks.spawn(
+        async move {
+            info!("executing");
+            let result = workflow(ctx).await;
+            handle_workflow_result(result, &db, &wf_name, &inst_id, &tx);
+        }
+        .instrument(span),
+    );
+
+    Invocation {
+        instance_id: instance_id.to_string(),
+        status: rx,
+    }
+}
+
+fn claim_suspended_step(
+    db: &Database,
+    workflow_name: &str,
+    instance_id: &str,
+    step_key: &str,
+    step_bytes: &[u8],
+) -> Result<(), EngineError> {
+    let composite_key = format!("{workflow_name}/{instance_id}/{step_key}");
+    let meta_key = format!("{workflow_name}/{instance_id}");
+
+    let write_txn = db.begin_write()?;
+    {
+        let mut steps_table = write_txn.open_table(STEPS)?;
+
+        match steps_table.get(composite_key.as_str())? {
+            None => {
+                return Err(EngineError::SignalRejected {
+                    key: step_key.to_string(),
+                    reason: "step does not exist".to_string(),
+                });
+            }
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                let envelope: StepEnvelope = deserialize_envelope(bytes, step_key)?;
+                if envelope.type_tag.is_some() {
+                    return Err(EngineError::SignalSuperseded {
+                        key: step_key.to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut meta_table = write_txn.open_table(WORKFLOW_META)?;
+
+        match meta_table.get(meta_key.as_str())? {
+            None => {
+                return Err(EngineError::SignalRejected {
+                    key: step_key.to_string(),
+                    reason: "workflow metadata not found".to_string(),
+                });
+            }
+            Some(guard) => {
+                let bytes: &[u8] = guard.value();
+                let meta: WorkflowMetadata =
+                    postcard::from_bytes(bytes).map_err(|e| EngineError::Serialization {
+                        key: meta_key.clone(),
+                        source: Box::new(e),
+                    })?;
+                if !matches!(meta.status(), MetadataStatus::Suspended(_)) {
+                    return Err(EngineError::SignalSuperseded {
+                        key: step_key.to_string(),
+                    });
+                }
+            }
+        }
+
+        steps_table.insert(composite_key.as_str(), step_bytes)?;
+
+        let running_meta = WorkflowMetadata::new(MetadataStatus::Running);
+        let meta_bytes =
+            postcard::to_allocvec(&running_meta).map_err(|e| EngineError::Serialization {
+                key: meta_key.clone(),
+                source: Box::new(e),
+            })?;
+        meta_table.insert(meta_key.as_str(), meta_bytes.as_slice())?;
+    }
+    write_txn.commit()?;
+
+    Ok(())
+}
+
+async fn poll_timers(
     db: &Arc<Database>,
     workflows: &HashMap<String, WorkflowFn>,
     timer_serial: &Arc<AtomicU64>,
+    tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
 ) -> Result<(), EngineError> {
     let now = now_unix_secs();
     let expired = collect_expired_timers(db, now)?;
 
     for (key, entry) in expired {
-        // Delete the timer row first — it's consumed regardless.
         let write_txn = db.begin_write()?;
         {
             let mut table = write_txn.open_table(TIMERS)?;
@@ -885,7 +998,7 @@ fn poll_timers(
         }
         write_txn.commit()?;
 
-        // Only signal if the workflow is still suspended.
+        // Fast-path: skip if workflow is clearly not suspended.
         let meta = metadata::read_metadata(db, &entry.workflow_name, &entry.instance_id)?;
         let is_suspended = meta
             .as_ref()
@@ -907,7 +1020,18 @@ fn poll_timers(
             "timer expired — signalling"
         );
 
-        signal_timer(db, workflows, timer_serial, &entry)?;
+        match signal_timer(db, workflows, timer_serial, tasks, &entry).await {
+            Ok(()) => {}
+            Err(EngineError::SignalSuperseded { ref key }) => {
+                info!(
+                    workflow = entry.workflow_name,
+                    instance = entry.instance_id,
+                    step = key,
+                    "timer claim superseded — signal already delivered"
+                );
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     Ok(())
@@ -940,138 +1064,39 @@ fn collect_expired_timers(
     Ok(expired)
 }
 
-fn verify_step_is_suspended(
-    db: &Database,
-    composite_key: &str,
-    step_key: &str,
-) -> Result<(), EngineError> {
-    let read_txn = db.begin_read()?;
-    let table = match read_txn.open_table(STEPS) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => {
-            return Err(EngineError::SignalRejected {
-                key: step_key.to_string(),
-                reason: "step does not exist".to_string(),
-            });
-        }
-        Err(e) => return Err(EngineError::from(e)),
-    };
-    match table.get(composite_key)? {
-        None => Err(EngineError::SignalRejected {
-            key: step_key.to_string(),
-            reason: "step does not exist".to_string(),
-        }),
-        Some(guard) => {
-            let envelope: StepEnvelope = deserialize_envelope(guard.value(), step_key)?;
-            match envelope.type_tag {
-                None => Ok(()),
-                Some(_) => Err(EngineError::SignalRejected {
-                    key: step_key.to_string(),
-                    reason: "step is already completed".to_string(),
-                }),
-            }
-        }
-    }
-}
-
-fn signal_timer(
+async fn signal_timer(
     db: &Arc<Database>,
     workflows: &HashMap<String, WorkflowFn>,
     timer_serial: &Arc<AtomicU64>,
+    tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
     entry: &TimerEntry,
 ) -> Result<(), EngineError> {
-    // Write completed entry to step table (payload is unit).
-    let composite_key = format!(
-        "{}/{}/{}",
-        entry.workflow_name, entry.instance_id, entry.step_key
-    );
-
-    verify_step_is_suspended(db, &composite_key, &entry.step_key)?;
-
     let data: StepData<()> = StepData::Completed {
         result: (),
         status: None,
     };
-    let bytes = serialize_step(&data, &entry.step_key)?;
-    let write_txn = db.begin_write()?;
-    {
-        let mut table = write_txn.open_table(STEPS)?;
-        table.insert(composite_key.as_str(), bytes.as_slice())?;
-    }
-    write_txn.commit()?;
+    let step_bytes = serialize_step(&data, &entry.step_key)?;
 
-    // Resume the workflow.
+    claim_suspended_step(
+        db,
+        &entry.workflow_name,
+        &entry.instance_id,
+        &entry.step_key,
+        &step_bytes,
+    )?;
+
     let workflow = workflows
         .get(&entry.workflow_name)
         .ok_or_else(|| EngineError::WorkflowNotFound(entry.workflow_name.clone()))?;
-    let workflow = Arc::clone(workflow);
-    let (tx, _rx) = watch::channel(WorkflowState::Started);
-    let db = Arc::clone(db);
-    let timer_serial = Arc::clone(timer_serial);
-    let ctx = Context::new(
-        entry.workflow_name.clone(),
-        entry.instance_id.clone(),
-        Arc::clone(&db),
-        tx.clone(),
-        timer_serial,
-    );
 
-    metadata::write_metadata(
-        &db,
+    let mut tasks = tasks.lock().await;
+    spawn_workflow_task(
+        &mut tasks,
+        workflow,
+        db,
         &entry.workflow_name,
         &entry.instance_id,
-        &WorkflowMetadata::new(MetadataStatus::Running),
-    )?;
-
-    let wf_name = entry.workflow_name.clone();
-    let inst_id = entry.instance_id.clone();
-    let span = info_span!("workflow", name = %wf_name, instance = %inst_id);
-
-    tokio::spawn(
-        async move {
-            info!("resuming after timer");
-            match workflow(ctx).await {
-                Ok(()) => {
-                    info!("completed");
-                    if let Err(e) = metadata::write_metadata(
-                        &db,
-                        &wf_name,
-                        &inst_id,
-                        &WorkflowMetadata::new(MetadataStatus::Completed),
-                    ) {
-                        error!(error = %e, "failed to write completion metadata");
-                    }
-                    let _ = tx.send(WorkflowState::Completed);
-                }
-                Err(EngineError::Suspended { ref key }) => {
-                    let status = tx.borrow().message().unwrap_or(key).to_string();
-                    info!(key, status, "suspended");
-                    if let Err(e) = metadata::write_metadata(
-                        &db,
-                        &wf_name,
-                        &inst_id,
-                        &WorkflowMetadata::new(MetadataStatus::Suspended(status.clone())),
-                    ) {
-                        error!(error = %e, "failed to write suspension metadata");
-                    }
-                    let _ = tx.send(WorkflowState::Suspended(status));
-                }
-                Err(e) => {
-                    info!(error = %e, "failed");
-                    let msg = e.to_string();
-                    if let Err(me) = metadata::write_metadata(
-                        &db,
-                        &wf_name,
-                        &inst_id,
-                        &WorkflowMetadata::new(MetadataStatus::Failed(msg.clone())),
-                    ) {
-                        error!(error = %me, "failed to write failure metadata");
-                    }
-                    let _ = tx.send(WorkflowState::Failed(msg));
-                }
-            }
-        }
-        .instrument(span),
+        timer_serial,
     );
 
     Ok(())
@@ -2391,13 +2416,13 @@ mod tests {
         let inv = engine.signal("wf", &id, "gate:v1", true).await.unwrap();
         inv.wait().await;
 
-        // Second signal to same step fails — it's now Completed.
+        // Second signal to same step fails — it was already claimed.
         let Err(err) = engine.signal("wf", &id, "gate:v1", true).await else {
-            panic!("expected SignalRejected error");
+            panic!("expected SignalSuperseded error");
         };
         assert!(
-            matches!(err, EngineError::SignalRejected { ref key, ref reason } if key == "gate:v1" && reason.contains("already completed")),
-            "expected SignalRejected for completed step, got {err:?}"
+            matches!(err, EngineError::SignalSuperseded { ref key } if key == "gate:v1"),
+            "expected SignalSuperseded for completed step, got {err:?}"
         );
     }
 
@@ -2533,5 +2558,118 @@ mod tests {
             }
             other => panic!("expected TypeMismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn double_signal_same_step_second_superseded() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("gate:v1").await?;
+            COUNTER.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        COUNTER.store(0, Ordering::Relaxed);
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        let (r1, r2) = tokio::join!(
+            engine.signal("wf", &id, "gate:v1", true),
+            engine.signal("wf", &id, "gate:v1", true),
+        );
+
+        let mut successes = 0u32;
+        let mut superseded = 0u32;
+        for r in [r1, r2] {
+            match r {
+                Ok(inv) => {
+                    inv.wait().await;
+                    successes += 1;
+                }
+                Err(EngineError::SignalSuperseded { .. }) => superseded += 1,
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+
+        assert_eq!(successes, 1, "exactly one signal should succeed");
+        assert_eq!(superseded, 1, "exactly one signal should be superseded");
+
+        engine.wait_all().await;
+        assert_eq!(
+            COUNTER.load(Ordering::Relaxed),
+            1,
+            "workflow should run exactly once after signal"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timer_after_signal_already_claimed() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            ctx.timer("wait:v1", Duration::from_secs(60))?;
+            COUNTER.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        COUNTER.store(0, Ordering::Relaxed);
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Manually signal the timer step before the timer fires.
+        let inv = engine.signal("wf", &id, "wait:v1", ()).await.unwrap();
+        inv.wait().await;
+
+        engine.wait_all().await;
+        assert_eq!(
+            COUNTER.load(Ordering::Relaxed),
+            1,
+            "workflow should run exactly once"
+        );
+
+        let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+        assert_eq!(*meta.status(), MetadataStatus::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn signal_timer_tracked_by_wait_all() {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            ctx.timer("tick:v1", Duration::from_secs(0))?;
+            COUNTER.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        COUNTER.store(0, Ordering::Relaxed);
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let _id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Let the timer fire and resume. wait_all should wait for the
+        // timer-resumed workflow (C1 fix verification).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        engine.wait_all().await;
+
+        assert_eq!(
+            COUNTER.load(Ordering::Relaxed),
+            1,
+            "timer-resumed workflow tracked by wait_all"
+        );
     }
 }

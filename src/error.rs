@@ -101,6 +101,30 @@ pub enum EngineError {
         reason: String,
     },
 
+    /// A signal was superseded because another caller already claimed the
+    /// suspended step.
+    ///
+    /// This is distinct from [`SignalRejected`](EngineError::SignalRejected),
+    /// which means the step was never suspended or does not exist.
+    /// `SignalSuperseded` means the step *was* suspended but another signal
+    /// or timer already claimed it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::EngineError;
+    ///
+    /// let err = EngineError::SignalSuperseded {
+    ///     key: "approval:v1".into(),
+    /// };
+    /// assert!(err.to_string().contains("superseded"));
+    /// ```
+    #[error("signal superseded for step '{key}': another caller already claimed it")]
+    SignalSuperseded {
+        /// The step key that was already claimed.
+        key: String,
+    },
+
     /// The workflow suspended at a step, awaiting an external signal.
     #[error("workflow suspended at step '{key}'")]
     Suspended {

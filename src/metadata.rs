@@ -7,7 +7,8 @@ use crate::error::EngineError;
 
 /// redb table for workflow metadata.
 /// Key: `"{workflow_name}/{instance_id}"`, Value: postcard-serialized bytes.
-const WORKFLOW_META: TableDefinition<&str, &[u8]> = TableDefinition::new("workflow_meta");
+pub(crate) const WORKFLOW_META: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("workflow_meta");
 
 /// Lifecycle status of a workflow instance.
 ///
