@@ -520,7 +520,10 @@ impl Context {
 
         let msg = format!("timer {key} (deadline {deadline})");
         span.in_scope(|| info!(deadline, "timer set — suspending"));
-        let _ = self.status_tx.send(WorkflowState::Suspended(msg.clone()));
+        self.status_tx.send_if_modified(|state| {
+            *state = WorkflowState::Suspended(msg.clone());
+            false
+        });
 
         Err(EngineError::Suspended {
             key: key.to_string(),
@@ -567,7 +570,10 @@ impl Context {
 
         let msg = status_msg.unwrap_or(key).to_string();
         span.in_scope(|| info!(status = %msg, "suspending"));
-        let _ = self.status_tx.send(WorkflowState::Suspended(msg.clone()));
+        self.status_tx.send_if_modified(|state| {
+            *state = WorkflowState::Suspended(msg.clone());
+            false
+        });
 
         Err(EngineError::Suspended {
             key: key.to_string(),

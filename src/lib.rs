@@ -94,6 +94,7 @@ mod engine;
 mod error;
 mod metadata;
 mod retry;
+mod stream;
 
 pub use context::{Context, StepBuilder, SuspendBuilder};
 pub use engine::{
@@ -102,3 +103,4 @@ pub use engine::{
 pub use error::{EngineError, StepError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};
 pub use retry::RetryPolicy;
+pub use stream::StatusStream;

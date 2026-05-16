@@ -3,8 +3,8 @@ use std::future::{Future, IntoFuture};
 use std::hash::{BuildHasher as _, RandomState};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::backends::InMemoryBackend;
@@ -24,6 +24,9 @@ use crate::context::{
 use crate::error::EngineError;
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 use crate::retry::RetryPolicy;
+use crate::stream::StatusStream;
+
+type Senders = Arc<Mutex<HashMap<String, watch::Sender<WorkflowState>>>>;
 
 /// Observable state of a workflow instance.
 ///
@@ -203,8 +206,9 @@ impl Invocation {
     /// ```
     pub async fn wait(mut self) -> WorkflowState {
         loop {
-            if self.status.borrow().is_terminal() {
-                return self.status.borrow().clone();
+            let ws = self.status.borrow().clone();
+            if ws.is_terminal() || matches!(ws, WorkflowState::Suspended(_)) {
+                return ws;
             }
             if self.status.changed().await.is_err() {
                 return self.status.borrow().clone();
@@ -486,6 +490,7 @@ impl EngineBuilder<HasStore> {
             tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
             timer_serial: Arc::new(AtomicU64::new(0)),
             default_retry: self.default_retry,
+            senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -536,6 +541,7 @@ pub struct Engine {
     tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     timer_serial: Arc<AtomicU64>,
     default_retry: Option<RetryPolicy>,
+    senders: Senders,
 }
 
 impl Engine {
@@ -624,6 +630,7 @@ impl Engine {
         let timer_serial = Arc::clone(&self.timer_serial);
         let poller_tasks = Arc::clone(&self.tasks);
         let default_retry = self.default_retry.clone();
+        let poller_senders = Arc::clone(&self.senders);
         let mut tasks = self.tasks.lock().await;
         tasks.spawn(
             async move {
@@ -636,6 +643,7 @@ impl Engine {
                         &timer_serial,
                         &poller_tasks,
                         default_retry.as_ref(),
+                        &poller_senders,
                     )
                     .await
                     {
@@ -824,7 +832,10 @@ impl Engine {
             .get(workflow_name)
             .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
 
-        Ok(spawn_workflow_task(
+        let tx = self.get_or_create_sender(instance_id);
+        let rx = tx.subscribe();
+
+        spawn_workflow_task(
             &mut tasks,
             workflow,
             &self.db,
@@ -832,7 +843,70 @@ impl Engine {
             instance_id,
             &self.timer_serial,
             self.default_retry.clone(),
-        ))
+            &tx,
+            &self.senders,
+        );
+
+        Ok(Invocation {
+            instance_id: instance_id.to_string(),
+            status: rx,
+        })
+    }
+
+    /// Subscribes to status updates for a workflow instance.
+    ///
+    /// Returns a [`StatusStream`] that immediately yields the current state,
+    /// then yields each subsequent state change. The stream ends when the
+    /// workflow completes, fails, or is replaced by a new run (e.g. after
+    /// [`signal`](Engine::signal)).
+    ///
+    /// When no live sender exists (e.g. after a server restart), falls back
+    /// to persisted metadata and returns a single-item stream with the last
+    /// known state.
+    ///
+    /// Returns `None` if the instance has never existed or has stale
+    /// `Running` metadata from a crash.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// let inv = engine.invoke("wf").await?;
+    /// let id = inv.instance_id().to_string();
+    ///
+    /// let stream = engine.subscribe("wf", &id).expect("live instance");
+    /// // Use with StreamExt::next(), .map(), .take_while(), etc.
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn subscribe(&self, workflow_name: &str, instance_id: &str) -> Option<StatusStream> {
+        let senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = senders.get(instance_id) {
+            return Some(StatusStream::live(tx.subscribe()));
+        }
+        drop(senders);
+
+        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id).ok()??;
+        match meta.status() {
+            MetadataStatus::Suspended(msg) => Some(StatusStream::snapshot(
+                WorkflowState::Suspended(msg.clone()),
+            )),
+            MetadataStatus::Completed => Some(StatusStream::snapshot(WorkflowState::Completed)),
+            MetadataStatus::Failed(msg) => {
+                Some(StatusStream::snapshot(WorkflowState::Failed(msg.clone())))
+            }
+            MetadataStatus::Running => None,
+        }
     }
 
     /// Returns the metadata for a specific workflow instance.
@@ -997,7 +1071,10 @@ impl Engine {
         }
         write_txn.commit()?;
 
-        Ok(spawn_workflow_task(
+        let tx = self.get_or_create_sender(&instance_id);
+        let rx = tx.subscribe();
+
+        spawn_workflow_task(
             &mut tasks,
             workflow,
             &self.db,
@@ -1005,7 +1082,31 @@ impl Engine {
             &instance_id,
             &self.timer_serial,
             self.default_retry.clone(),
-        ))
+            &tx,
+            &self.senders,
+        );
+
+        Ok(Invocation {
+            instance_id,
+            status: rx,
+        })
+    }
+
+    fn get_or_create_sender(&self, instance_id: &str) -> watch::Sender<WorkflowState> {
+        let mut senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = senders.get(instance_id) {
+            tx.send_if_modified(|state| {
+                *state = WorkflowState::Started;
+                false
+            });
+            return tx.clone();
+        }
+        let (tx, _) = watch::channel(WorkflowState::Started);
+        senders.insert(instance_id.to_string(), tx.clone());
+        tx
     }
 }
 
@@ -1068,6 +1169,7 @@ fn handle_workflow_result(
     }
 }
 
+#[expect(clippy::too_many_arguments)]
 fn spawn_workflow_task(
     tasks: &mut JoinSet<()>,
     workflow: &WorkflowFn,
@@ -1076,9 +1178,10 @@ fn spawn_workflow_task(
     instance_id: &str,
     timer_serial: &Arc<AtomicU64>,
     default_retry: Option<RetryPolicy>,
-) -> Invocation {
+    tx: &watch::Sender<WorkflowState>,
+    senders: &Senders,
+) {
     let workflow = Arc::clone(workflow);
-    let (tx, rx) = watch::channel(WorkflowState::Started);
     let db = Arc::clone(db);
     let ctx = Context::new(
         workflow_name.to_string(),
@@ -1091,21 +1194,25 @@ fn spawn_workflow_task(
 
     let wf_name = workflow_name.to_string();
     let inst_id = instance_id.to_string();
+    let tx = tx.clone();
+    let senders = Arc::clone(senders);
     let span = info_span!("workflow", name = %wf_name, instance = %inst_id);
 
     tasks.spawn(
         async move {
             info!("executing");
             let result = workflow(ctx).await;
+            let terminal = !matches!(&result, Err(EngineError::Suspended { .. }));
             handle_workflow_result(result, &db, &wf_name, &inst_id, &tx);
+            if terminal {
+                senders
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&inst_id);
+            }
         }
         .instrument(span),
     );
-
-    Invocation {
-        instance_id: instance_id.to_string(),
-        status: rx,
-    }
 }
 
 fn claim_suspended_step(
@@ -1185,6 +1292,7 @@ async fn poll_timers(
     timer_serial: &Arc<AtomicU64>,
     tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
     default_retry: Option<&RetryPolicy>,
+    senders: &Senders,
 ) -> Result<(), EngineError> {
     let now = now_unix_millis();
     let expired = collect_expired_timers(db, now)?;
@@ -1219,7 +1327,17 @@ async fn poll_timers(
             "timer expired — signalling"
         );
 
-        match signal_timer(db, workflows, timer_serial, tasks, &entry, default_retry).await {
+        match signal_timer(
+            db,
+            workflows,
+            timer_serial,
+            tasks,
+            &entry,
+            default_retry,
+            senders,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(EngineError::SignalSuperseded { ref key }) => {
                 info!(
@@ -1270,6 +1388,7 @@ async fn signal_timer(
     tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
     entry: &TimerEntry,
     default_retry: Option<&RetryPolicy>,
+    senders: &Senders,
 ) -> Result<(), EngineError> {
     let data: StepData<()> = StepData::Completed {
         result: (),
@@ -1289,6 +1408,23 @@ async fn signal_timer(
         .get(&entry.workflow_name)
         .ok_or_else(|| EngineError::WorkflowNotFound(entry.workflow_name.clone()))?;
 
+    let tx = {
+        let mut map = senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = map.get(&entry.instance_id) {
+            tx.send_if_modified(|state| {
+                *state = WorkflowState::Started;
+                false
+            });
+            tx.clone()
+        } else {
+            let (tx, _) = watch::channel(WorkflowState::Started);
+            map.insert(entry.instance_id.clone(), tx.clone());
+            tx
+        }
+    };
+
     let mut tasks = tasks.lock().await;
     spawn_workflow_task(
         &mut tasks,
@@ -1298,6 +1434,8 @@ async fn signal_timer(
         &entry.instance_id,
         timer_serial,
         default_retry.cloned(),
+        &tx,
+        senders,
     );
 
     Ok(())
@@ -3464,5 +3602,186 @@ mod tests {
             .wait()
             .await;
         assert_eq!(state, WorkflowState::Completed);
+    }
+
+    #[tokio::test]
+    async fn subscribe_live_workflow_yields_states() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            ctx.set_status("step one");
+            let _: String = ctx.step("a:v1").run(async || Ok("done".into())).await?;
+            ctx.set_status("step two");
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+
+        let mut stream = engine.subscribe("wf", &id).unwrap();
+        let first = stream.next().await.unwrap();
+        assert_eq!(first, WorkflowState::Started);
+
+        inv.wait().await;
+
+        let mut states = vec![];
+        while let Some(s) = stream.next().await {
+            states.push(s);
+        }
+        assert!(states.contains(&WorkflowState::Completed));
+    }
+
+    #[tokio::test]
+    async fn subscribe_after_completion_returns_snapshot() {
+        async fn wf(_ctx: Context) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        let mut stream = engine.subscribe("wf", &id).unwrap();
+        assert_eq!(stream.next().await, Some(WorkflowState::Completed));
+        assert_eq!(stream.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_instance_returns_none() {
+        let mut engine = test_engine();
+        engine.register("wf", |_ctx: Context| async { Ok(()) });
+        engine.start().await.unwrap();
+
+        assert!(engine.subscribe("wf", "nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribe_survives_suspend_and_signal() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            ctx.set_status("working");
+            let _: bool = ctx.suspend("gate:v1").await?;
+            ctx.set_status("resumed");
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+
+        let mut stream = engine.subscribe("wf", &id).unwrap();
+
+        // Consume states through suspension
+        inv.wait().await;
+        let mut saw_suspended = false;
+        while let Some(s) = stream.next().await {
+            if matches!(s, WorkflowState::Suspended(_)) {
+                saw_suspended = true;
+                break;
+            }
+        }
+        assert!(saw_suspended);
+
+        // Signal — subscriber should see resumed execution on same stream
+        engine
+            .signal("wf", &id, "gate:v1", true)
+            .await
+            .unwrap()
+            .wait()
+            .await;
+
+        let mut saw_completed = false;
+        while let Some(s) = stream.next().await {
+            if s == WorkflowState::Completed {
+                saw_completed = true;
+                break;
+            }
+        }
+        assert!(saw_completed);
+    }
+
+    #[tokio::test]
+    async fn subscribe_multiple_concurrent_subscribers() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            ctx.set_status("hello");
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+
+        let mut s1 = engine.subscribe("wf", &id).unwrap();
+        let mut s2 = engine.subscribe("wf", &id).unwrap();
+
+        inv.wait().await;
+
+        // Both subscribers receive updates
+        let mut s1_states = vec![];
+        while let Some(s) = s1.next().await {
+            s1_states.push(s);
+        }
+        let mut s2_states = vec![];
+        while let Some(s) = s2.next().await {
+            s2_states.push(s);
+        }
+
+        assert!(s1_states.contains(&WorkflowState::Completed));
+        assert!(s2_states.contains(&WorkflowState::Completed));
+    }
+
+    #[tokio::test]
+    async fn subscribe_suspended_returns_live_stream() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("gate:v1").await?;
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // Subscribing to a suspended workflow returns a live stream
+        // (sender stays in map). First item is the current Suspended state.
+        let mut stream = engine.subscribe("wf", &id).unwrap();
+        let state = stream.next().await.unwrap();
+        assert!(matches!(state, WorkflowState::Suspended(_)));
+    }
+
+    #[tokio::test]
+    async fn subscribe_fallback_completed_metadata() {
+        async fn wf(_ctx: Context) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        // After completion the sender is removed from the map.
+        // subscribe() falls through to redb metadata and returns a snapshot.
+        tokio::task::yield_now().await;
+        let mut stream = engine.subscribe("wf", &id).unwrap();
+        assert_eq!(stream.next().await, Some(WorkflowState::Completed));
+        assert_eq!(stream.next().await, None);
     }
 }
