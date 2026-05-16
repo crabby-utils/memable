@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{self, Poll};
@@ -60,6 +61,17 @@ enum LiveState {
     Idle(watch::Receiver<WorkflowState>),
     Waiting(ChangedFuture),
     Transitioning,
+}
+
+impl fmt::Debug for StatusStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.inner {
+            Inner::Live(_) => f.debug_struct("StatusStream").field("kind", &"live").finish(),
+            Inner::Snapshot(s) => {
+                f.debug_struct("StatusStream").field("snapshot", s).finish()
+            }
+        }
+    }
 }
 
 impl StatusStream {

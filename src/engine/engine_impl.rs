@@ -19,7 +19,7 @@ use super::execution::{
 use super::invocation::{Invocation, InvocationBuilder};
 use super::{Senders, WorkflowFn, WorkflowState};
 use crate::context::{Context, STEPS, StepData, SuspendPoint, serialize_step};
-use crate::error::EngineError;
+use crate::error::{EngineError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 use crate::retry::RetryPolicy;
 use crate::stream::StatusStream;
@@ -433,13 +433,17 @@ impl Engine {
     /// to persisted metadata and returns a single-item stream with the last
     /// known state.
     ///
-    /// Returns `None` if the instance has never existed or has stale
-    /// `Running` metadata from a crash.
+    /// # Errors
+    ///
+    /// Returns [`SubscribeError::NotFound`] if no instance with the given
+    /// name and ID exists, [`SubscribeError::StaleRunning`] if the instance
+    /// has `Running` metadata but no live task (crash recovery scenario),
+    /// or [`SubscribeError::Storage`] if the database read fails.
     ///
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowState, SubscribeError};
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -449,37 +453,51 @@ impl Engine {
     /// let inv = engine.invoke("wf").await?;
     /// let id = inv.instance_id().to_string();
     ///
-    /// let stream = engine.subscribe("wf", &id).expect("live instance");
+    /// let stream = engine.subscribe("wf", &id)?;
     /// // Use with StreamExt::next(), .map(), .take_while(), etc.
     /// # Ok(())
     /// # }
     /// ```
-    #[must_use]
-    pub fn subscribe(&self, workflow_name: &str, instance_id: &str) -> Option<StatusStream> {
+    pub fn subscribe(
+        &self,
+        workflow_name: &str,
+        instance_id: &str,
+    ) -> Result<StatusStream, SubscribeError> {
         let senders = self
             .senders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(tx) = senders.get(instance_id) {
-            return Some(StatusStream::live(tx.subscribe()));
+            return Ok(StatusStream::live(tx.subscribe()));
         }
         drop(senders);
 
-        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id).ok()??;
-        match meta.status() {
-            MetadataStatus::Suspended { key, status } => {
-                Some(StatusStream::snapshot(WorkflowState::Suspended {
-                    key: key.clone(),
-                    status: status.clone(),
-                }))
-            }
-            MetadataStatus::Completed(msg) => Some(StatusStream::snapshot(
-                WorkflowState::Completed(msg.clone()),
-            )),
-            MetadataStatus::Failed(msg) => {
-                Some(StatusStream::snapshot(WorkflowState::Failed(msg.clone())))
-            }
-            MetadataStatus::Running => None,
+        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id)
+            .map_err(|e| SubscribeError::Storage(e.to_string().into()))?;
+
+        match meta {
+            None => Err(SubscribeError::NotFound {
+                workflow_name: workflow_name.to_string(),
+                instance_id: instance_id.to_string(),
+            }),
+            Some(meta) => match meta.status() {
+                MetadataStatus::Suspended { key, status } => {
+                    Ok(StatusStream::snapshot(WorkflowState::Suspended {
+                        key: key.clone(),
+                        status: status.clone(),
+                    }))
+                }
+                MetadataStatus::Completed(msg) => Ok(StatusStream::snapshot(
+                    WorkflowState::Completed(msg.clone()),
+                )),
+                MetadataStatus::Failed(msg) => {
+                    Ok(StatusStream::snapshot(WorkflowState::Failed(msg.clone())))
+                }
+                MetadataStatus::Running => Err(SubscribeError::StaleRunning {
+                    workflow_name: workflow_name.to_string(),
+                    instance_id: instance_id.to_string(),
+                }),
+            },
         }
     }
 

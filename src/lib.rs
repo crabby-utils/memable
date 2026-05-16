@@ -100,7 +100,7 @@ pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint};
 pub use engine::{
     Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, WorkflowState,
 };
-pub use error::{EngineError, StepError};
+pub use error::{EngineError, StepError, SubscribeError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};
 pub use retry::RetryPolicy;
 pub use stream::StatusStream;

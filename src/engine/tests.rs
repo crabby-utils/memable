@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::*;
 use crate::StepError;
 use crate::context::SuspendPoint;
+use crate::error::SubscribeError;
 use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 
 fn test_engine() -> Engine {
@@ -2245,12 +2246,41 @@ async fn subscribe_after_completion_returns_snapshot() {
 }
 
 #[tokio::test]
-async fn subscribe_unknown_instance_returns_none() {
+async fn subscribe_unknown_instance_returns_not_found() {
     let mut engine = test_engine();
     engine.register("wf", |_ctx: Context| async { Ok(()) });
     engine.start().await.unwrap();
 
-    assert!(engine.subscribe("wf", "nonexistent").is_none());
+    let err = engine.subscribe("wf", "nonexistent").unwrap_err();
+    assert!(matches!(err, SubscribeError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn subscribe_stale_running_returns_error() {
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let path = tmp.path().to_path_buf();
+
+    {
+        let db = redb::Database::create(&path).unwrap();
+        metadata::write_metadata(
+            &db,
+            "wf",
+            "crashed",
+            &WorkflowMetadata::new(MetadataStatus::Running),
+        )
+        .unwrap();
+    }
+
+    let mut engine = Engine::builder()
+        .open(&path)
+        .unwrap()
+        .resume_on_start(false)
+        .build();
+    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.start().await.unwrap();
+
+    let err = engine.subscribe("wf", "crashed").unwrap_err();
+    assert!(matches!(err, SubscribeError::StaleRunning { .. }));
 }
 
 #[tokio::test]

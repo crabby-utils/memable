@@ -266,6 +266,54 @@ impl From<redb::CommitError> for EngineError {
     }
 }
 
+/// Error returned by [`Engine::subscribe`](crate::Engine::subscribe).
+///
+/// Distinguishes between an instance that never existed and one that has
+/// stale `Running` metadata from a crash (no live task backing it).
+///
+/// # Examples
+///
+/// ```
+/// use memable::SubscribeError;
+///
+/// let err = SubscribeError::NotFound {
+///     workflow_name: "etl".into(),
+///     instance_id: "run-42".into(),
+/// };
+/// assert!(err.to_string().contains("etl"));
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum SubscribeError {
+    /// No instance with this workflow name and ID exists.
+    #[error("no instance found for workflow '{workflow_name}' with id '{instance_id}'")]
+    NotFound {
+        /// The workflow name that was queried.
+        workflow_name: String,
+        /// The instance ID that was queried.
+        instance_id: String,
+    },
+
+    /// The instance has persisted `Running` metadata but no live task.
+    ///
+    /// This typically indicates the process crashed while the workflow was
+    /// executing. The instance may be recoverable via
+    /// [`Engine::resume`](crate::Engine::resume).
+    #[error(
+        "instance '{instance_id}' of workflow '{workflow_name}' has stale Running metadata \
+         (likely crashed) — consider calling resume()"
+    )]
+    StaleRunning {
+        /// The workflow name.
+        workflow_name: String,
+        /// The instance ID with stale state.
+        instance_id: String,
+    },
+
+    /// A storage operation failed while reading metadata.
+    #[error("storage error: {0}")]
+    Storage(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Error returned by step closures.
 ///
 /// The variant communicates retry intent to the engine:
