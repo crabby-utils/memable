@@ -30,9 +30,16 @@ pub enum MetadataStatus {
     /// The workflow is currently executing.
     Running,
     /// The workflow is suspended, awaiting an external signal.
-    Suspended(String),
+    Suspended {
+        /// The step key identifying this suspend point.
+        key: String,
+        /// Human-readable status message.
+        status: String,
+    },
     /// The workflow completed successfully.
-    Completed,
+    ///
+    /// Contains the last status message at completion time, if any.
+    Completed(Option<String>),
     /// The workflow failed with an error message.
     Failed(String),
 }
@@ -45,14 +52,13 @@ impl MetadataStatus {
     /// ```
     /// use memable::MetadataStatus;
     ///
-    /// assert!(MetadataStatus::Completed.is_terminal());
+    /// assert!(MetadataStatus::Completed(None).is_terminal());
     /// assert!(MetadataStatus::Failed("err".into()).is_terminal());
     /// assert!(!MetadataStatus::Running.is_terminal());
-    /// assert!(!MetadataStatus::Suspended("waiting".into()).is_terminal());
     /// ```
     #[must_use]
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed | Self::Failed(_))
+        matches!(self, Self::Completed(_) | Self::Failed(_))
     }
 }
 
@@ -60,8 +66,9 @@ impl std::fmt::Display for MetadataStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Running => write!(f, "running"),
-            Self::Suspended(msg) => write!(f, "suspended: {msg}"),
-            Self::Completed => write!(f, "completed"),
+            Self::Suspended { status, .. } => write!(f, "suspended: {status}"),
+            Self::Completed(None) => write!(f, "completed"),
+            Self::Completed(Some(msg)) => write!(f, "completed: {msg}"),
             Self::Failed(msg) => write!(f, "failed: {msg}"),
         }
     }
@@ -98,7 +105,7 @@ impl WorkflowMetadata {
     /// ```
     /// use memable::{MetadataStatus, WorkflowMetadata};
     ///
-    /// let meta = WorkflowMetadata::new(MetadataStatus::Completed);
+    /// let meta = WorkflowMetadata::new(MetadataStatus::Completed(None));
     /// assert!(meta.completed_at().is_some());
     /// ```
     #[must_use]
@@ -140,7 +147,7 @@ impl WorkflowMetadata {
     /// let meta = WorkflowMetadata::new(MetadataStatus::Running);
     /// assert!(meta.completed_at().is_none());
     ///
-    /// let meta = WorkflowMetadata::new(MetadataStatus::Completed);
+    /// let meta = WorkflowMetadata::new(MetadataStatus::Completed(None));
     /// assert!(meta.completed_at().is_some());
     /// ```
     #[must_use]

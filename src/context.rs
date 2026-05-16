@@ -16,6 +16,74 @@ use crate::engine::WorkflowState;
 use crate::error::{EngineError, StepError};
 use crate::retry::RetryPolicy;
 
+/// A typed suspend point that encodes both the step key and payload type.
+///
+/// Define as a `const` and share between the workflow (via [`Context::suspend`])
+/// and the signal call (via [`Engine::signal`](crate::Engine::signal)) to get
+/// compile-time guarantees that both sides agree on the key and payload type.
+///
+/// # Examples
+///
+/// ```
+/// use memable::SuspendPoint;
+///
+/// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
+/// ```
+pub struct SuspendPoint<T> {
+    key: &'static str,
+    _marker: PhantomData<T>,
+}
+
+impl<T> SuspendPoint<T> {
+    /// Creates a new suspend point with the given key.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time (or runtime if not called in a const context)
+    /// if `key` contains `/` or starts with `_`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::SuspendPoint;
+    ///
+    /// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
+    /// assert_eq!(APPROVAL.key(), "approval:v1");
+    /// ```
+    #[must_use]
+    pub const fn new(key: &'static str) -> Self {
+        let bytes = key.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i] != b'/', "suspend point key must not contain '/'");
+            i += 1;
+        }
+        assert!(
+            bytes.is_empty() || bytes[0] != b'_',
+            "suspend point key must not start with '_'"
+        );
+        Self {
+            key,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the string key for this suspend point.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::SuspendPoint;
+    ///
+    /// const POINT: SuspendPoint<String> = SuspendPoint::new("step:v1");
+    /// assert_eq!(POINT.key(), "step:v1");
+    /// ```
+    #[must_use]
+    pub const fn key(&self) -> &'static str {
+        self.key
+    }
+}
+
 /// redb table for step results.
 /// Key: `"{workflow_name}/{instance_id}/{step_key}"`, Value: postcard-serialized bytes.
 pub(crate) const STEPS: TableDefinition<&str, &[u8]> = TableDefinition::new("steps");
@@ -45,6 +113,15 @@ pub(crate) enum StepData<T> {
     Failed { error: String },
 }
 
+/// Discriminant for the step's lifecycle state, stored explicitly in the
+/// envelope so that state checks don't rely on the type-tag encoding.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepState {
+    Suspended,
+    Completed,
+    Failed,
+}
+
 /// Storage envelope that wraps serialized [`StepData<T>`] with a type tag.
 ///
 /// The type tag enables detection of payload type mismatches between
@@ -52,7 +129,8 @@ pub(crate) enum StepData<T> {
 /// before deserialization is attempted.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct StepEnvelope {
-    /// `Some(type_name)` for `Completed` entries, `None` for `Suspended`.
+    pub state: StepState,
+    /// `Some(type_name)` for `Completed` entries, `None` otherwise.
     pub type_tag: Option<String>,
     /// Postcard-serialized `StepData<T>` bytes.
     data: Vec<u8>,
@@ -63,15 +141,20 @@ pub(crate) fn serialize_step<T: Serialize>(
     data: &StepData<T>,
     key: &str,
 ) -> Result<Vec<u8>, EngineError> {
-    let type_tag = match data {
-        StepData::Completed { .. } => Some(std::any::type_name::<T>().to_string()),
-        StepData::Suspended | StepData::Failed { .. } => None,
+    let (state, type_tag) = match data {
+        StepData::Completed { .. } => (
+            StepState::Completed,
+            Some(std::any::type_name::<T>().to_string()),
+        ),
+        StepData::Suspended => (StepState::Suspended, None),
+        StepData::Failed { .. } => (StepState::Failed, None),
     };
     let inner = postcard::to_allocvec(data).map_err(|e| EngineError::Serialization {
         key: key.to_string(),
         source: Box::new(e),
     })?;
     let envelope = StepEnvelope {
+        state,
         type_tag,
         data: inner,
     };
@@ -237,7 +320,7 @@ impl Context {
     /// engine.start().await?;
     ///
     /// let state = engine.invoke("greet").input("Alice".to_string()).await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed);
+    /// assert_eq!(state, WorkflowState::Completed(None));
     /// # Ok(())
     /// # }
     /// ```
@@ -279,7 +362,7 @@ impl Context {
     ///
     /// let mut inv = engine.invoke("pipeline").await?;
     /// let state = inv.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed);
+    /// assert_eq!(state, WorkflowState::Completed(Some("processing".into())));
     /// # Ok(())
     /// # }
     /// ```
@@ -338,7 +421,7 @@ impl Context {
     /// });
     /// engine.start().await?;
     /// let state = engine.invoke("example").await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed);
+    /// assert_eq!(state, WorkflowState::Completed(None));
     /// # Ok(())
     /// # }
     /// ```
@@ -371,11 +454,6 @@ impl Context {
     /// Use [`.status()`](SuspendBuilder::status) to set a custom status
     /// message (defaults to the step key).
     ///
-    /// # Panics
-    ///
-    /// Panics if `key` contains `/` or starts with `_` (reserved for
-    /// engine use).
-    ///
     /// # Errors
     ///
     /// Returns [`EngineError::Suspended`] when the workflow should suspend.
@@ -385,10 +463,12 @@ impl Context {
     /// # Examples
     ///
     /// ```
-    /// use memable::{Context, EngineError};
+    /// use memable::{Context, EngineError, SuspendPoint};
+    ///
+    /// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
     ///
     /// async fn approval_workflow(ctx: Context) -> Result<(), EngineError> {
-    ///     let approved: bool = ctx.suspend("approval:v1")
+    ///     let approved: bool = ctx.suspend(&APPROVAL)
     ///         .status("Waiting for manager approval")
     ///         .await?;
     ///     if approved {
@@ -397,21 +477,13 @@ impl Context {
     ///     Ok(())
     /// }
     /// ```
-    pub fn suspend<'a, T>(&'a self, key: &'a str) -> SuspendBuilder<'a, T>
+    pub fn suspend<'a, T>(&'a self, point: &'a SuspendPoint<T>) -> SuspendBuilder<'a, T>
     where
         T: Serialize + DeserializeOwned + Send,
     {
-        assert!(
-            !key.contains('/'),
-            "suspend key must not contain '/': '{key}'"
-        );
-        assert!(
-            !key.starts_with('_'),
-            "suspend keys starting with '_' are reserved: '{key}'"
-        );
         SuspendBuilder {
             ctx: self,
-            key,
+            key: point.key(),
             status_msg: None,
             _marker: PhantomData,
         }
@@ -521,7 +593,10 @@ impl Context {
         let msg = format!("timer {key} (deadline {deadline})");
         span.in_scope(|| info!(deadline, "timer set — suspending"));
         self.status_tx.send_if_modified(|state| {
-            *state = WorkflowState::Suspended(msg.clone());
+            *state = WorkflowState::Suspended {
+                key: key.to_string(),
+                status: msg.clone(),
+            };
             false
         });
 
@@ -571,7 +646,10 @@ impl Context {
         let msg = status_msg.unwrap_or(key).to_string();
         span.in_scope(|| info!(status = %msg, "suspending"));
         self.status_tx.send_if_modified(|state| {
-            *state = WorkflowState::Suspended(msg.clone());
+            *state = WorkflowState::Suspended {
+                key: key.to_string(),
+                status: msg.clone(),
+            };
             false
         });
 
@@ -621,14 +699,17 @@ impl Context {
 /// # Examples
 ///
 /// ```
-/// use memable::{Context, EngineError};
+/// use memable::{Context, EngineError, SuspendPoint};
+///
+/// const WAIT: SuspendPoint<String> = SuspendPoint::new("wait:v1");
+/// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
 ///
 /// async fn workflow(ctx: Context) -> Result<(), EngineError> {
 ///     // Simple suspend — status defaults to the step key.
-///     let payload: String = ctx.suspend("wait:v1").await?;
+///     let payload: String = ctx.suspend(&WAIT).await?;
 ///
 ///     // Suspend with custom status message.
-///     let approved: bool = ctx.suspend("approval:v1")
+///     let approved: bool = ctx.suspend(&APPROVAL)
 ///         .status("Waiting for manager approval")
 ///         .await?;
 ///     Ok(())
@@ -652,9 +733,10 @@ where
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Context, EngineError};
+    /// # use memable::{Context, EngineError, SuspendPoint};
+    /// # const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
-    /// let approved: bool = ctx.suspend("approval:v1")
+    /// let approved: bool = ctx.suspend(&APPROVAL)
     ///     .status("Waiting for manager approval")
     ///     .await?;
     /// # Ok(())
@@ -841,7 +923,7 @@ impl StepBuilder<'_> {
     /// });
     /// engine.start().await?;
     /// let state = engine.invoke("example").await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed);
+    /// assert_eq!(state, WorkflowState::Completed(None));
     /// # Ok(())
     /// # }
     /// ```

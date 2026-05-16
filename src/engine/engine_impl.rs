@@ -1,0 +1,685 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use redb::Database;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tracing::Instrument as _;
+use tracing::{error, info, info_span, warn};
+
+use super::builder::{EngineBuilder, NoStore};
+use super::execution::{
+    claim_suspended_step, poll_timers, spawn_workflow_task, validate_key_component,
+};
+use super::invocation::{Invocation, InvocationBuilder};
+use super::{Senders, WorkflowFn, WorkflowState};
+use crate::context::{Context, STEPS, StepData, SuspendPoint, serialize_step};
+use crate::error::EngineError;
+use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
+use crate::retry::RetryPolicy;
+use crate::stream::StatusStream;
+
+/// The durable execution engine.
+///
+/// Workflows are registered as named definitions, then invoked by name.
+/// Each invocation auto-generates a unique instance ID and returns an
+/// [`Invocation`] handle for observing the workflow's [`WorkflowState`].
+/// Failed instances can be retried with [`Engine::resume`].
+///
+/// # Lifecycle
+///
+/// 1. Build with [`Engine::builder`]
+/// 2. Register workflows with [`Engine::register`]
+/// 3. Start with [`Engine::start`]
+/// 4. Invoke workflows with [`Engine::invoke`]
+/// 5. Stop with [`Engine::stop`]
+///
+/// # Examples
+///
+/// ```
+/// use memable::{Engine, Context, EngineError, WorkflowState};
+///
+/// async fn greet(ctx: Context) -> Result<(), EngineError> {
+///     let name: String = ctx.step("fetch-name:v1").run(async || {
+///         Ok("world".to_string())
+///     }).await?;
+///     assert_eq!(name, "world");
+///     Ok(())
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut engine = Engine::builder().in_memory().build();
+/// engine.register("greet", greet);
+/// engine.start().await?;
+///
+/// let state = engine.invoke("greet").await?.wait().await;
+/// assert_eq!(state, WorkflowState::Completed(None));
+/// # Ok(())
+/// # }
+/// ```
+pub struct Engine {
+    pub(super) db: Arc<Database>,
+    pub(super) workflows: HashMap<String, WorkflowFn>,
+    pub(super) running: Arc<AtomicBool>,
+    pub(super) tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    pub(super) timer_serial: Arc<AtomicU64>,
+    pub(super) default_retry: Option<RetryPolicy>,
+    pub(super) resume_on_start: bool,
+    pub(super) senders: Senders,
+}
+
+impl Engine {
+    /// Returns a new [`EngineBuilder`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder().in_memory().build();
+    /// ```
+    #[must_use]
+    pub fn builder() -> EngineBuilder<NoStore> {
+        EngineBuilder {
+            store: NoStore,
+            default_retry: None,
+            resume_on_start: true,
+        }
+    }
+
+    /// Registers a workflow definition by name.
+    ///
+    /// The workflow function receives a [`Context`] and returns
+    /// `Result<(), EngineError>`. Durable results are communicated via
+    /// [`Context::step`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine has already been started, or if `name`
+    /// contains the `/` delimiter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError};
+    /// async fn my_workflow(ctx: Context) -> Result<(), EngineError> {
+    ///     Ok(())
+    /// }
+    ///
+    /// let mut engine = Engine::builder().in_memory().build();
+    /// engine.register("my-workflow", my_workflow);
+    /// ```
+    pub fn register<F, Fut>(&mut self, name: impl Into<String>, workflow: F)
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), EngineError>> + Send + 'static,
+    {
+        assert!(
+            !self.running.load(Ordering::Acquire),
+            "cannot register workflows after the engine has started"
+        );
+        let name = name.into();
+        assert!(
+            !name.contains('/'),
+            "workflow name must not contain '/': '{name}'"
+        );
+        info!(name, "registered workflow");
+        self.workflows
+            .insert(name, Arc::new(move |ctx| Box::pin(workflow(ctx))));
+    }
+
+    /// Starts the engine, allowing workflow invocations.
+    ///
+    /// Spawns a background timer poller that checks for expired durable
+    /// timers every second. Timer deadlines have millisecond precision, but
+    /// actual firing latency is up to ~1 second after the deadline.
+    /// Must be called after all workflows are registered.
+    ///
+    /// When [`EngineBuilder::resume_on_start`] is enabled (the default),
+    /// scans the metadata table and resumes any instances that were
+    /// `Running` when the process last exited. `Suspended` instances are
+    /// not resumed — they continue to wait for their signal or timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if startup fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the engine has already been started.
+    pub async fn start(&mut self) -> Result<(), EngineError> {
+        assert!(
+            !self.running.load(Ordering::Acquire),
+            "engine has already been started"
+        );
+        self.running.store(true, Ordering::Release);
+
+        let db = Arc::clone(&self.db);
+        let running = Arc::clone(&self.running);
+        let workflows = self.workflows.clone();
+        let timer_serial = Arc::clone(&self.timer_serial);
+        let poller_tasks = Arc::clone(&self.tasks);
+        let default_retry = self.default_retry.clone();
+        let poller_senders = Arc::clone(&self.senders);
+        let mut tasks = self.tasks.lock().await;
+        tasks.spawn(
+            async move {
+                info!("timer poller started");
+                while running.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Err(e) = poll_timers(
+                        &db,
+                        &workflows,
+                        &timer_serial,
+                        &poller_tasks,
+                        default_retry.as_ref(),
+                        &poller_senders,
+                    )
+                    .await
+                    {
+                        error!(error = %e, "timer poll failed");
+                    }
+                }
+                info!("timer poller stopped");
+            }
+            .instrument(info_span!("timer_poller")),
+        );
+
+        drop(tasks);
+
+        if self.resume_on_start {
+            self.resume_running_instances().await?;
+        }
+
+        info!("engine started");
+        Ok(())
+    }
+
+    async fn resume_running_instances(&self) -> Result<(), EngineError> {
+        let workflow_names: Vec<String> = self.workflows.keys().cloned().collect();
+        for workflow_name in &workflow_names {
+            let instances = metadata::list_metadata(&self.db, workflow_name)?;
+            for (instance_id, meta) in instances {
+                if *meta.status() == MetadataStatus::Running {
+                    info!(
+                        workflow = %workflow_name,
+                        instance_id = %instance_id,
+                        "auto-resuming workflow instance"
+                    );
+                    match self
+                        .spawn_workflow(workflow_name, instance_id.clone(), None)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                workflow = %workflow_name,
+                                instance_id = %instance_id,
+                                error = %e,
+                                "failed to auto-resume workflow instance, skipping"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Invokes a registered workflow, creating a new instance.
+    ///
+    /// Returns an [`InvocationBuilder`] that can be awaited directly or
+    /// chained with [`.input(payload)`](InvocationBuilder::input) to pass
+    /// typed data the workflow reads via [`Context::input`].
+    ///
+    /// A unique instance ID is generated automatically. The workflow runs
+    /// in a spawned Tokio task.
+    ///
+    /// # Errors
+    ///
+    /// The returned builder yields [`EngineError::NotStarted`] if the engine
+    /// has not been started, [`EngineError::WorkflowNotFound`] if no workflow
+    /// is registered under the given name, or [`EngineError::InvalidKey`] if
+    /// the name contains `/`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn greet(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("greet", greet);
+    /// # engine.start().await?;
+    /// // Without input:
+    /// let invocation = engine.invoke("greet").await?;
+    /// println!("Started instance {}", invocation.instance_id());
+    ///
+    /// // With input:
+    /// let invocation = engine.invoke("greet").input(42_i32).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn invoke(&self, workflow_name: impl Into<String>) -> InvocationBuilder<'_> {
+        InvocationBuilder {
+            engine: self,
+            workflow_name: workflow_name.into(),
+            input_payload: Ok(None),
+        }
+    }
+
+    /// Resumes a previously failed or incomplete workflow instance.
+    ///
+    /// Re-runs the workflow with the same instance ID. Completed steps
+    /// return their memoised results; only incomplete or failed steps
+    /// re-execute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::NotStarted`] if the engine has not been started,
+    /// [`EngineError::WorkflowNotFound`] if no workflow is registered
+    /// under the given name, or [`EngineError::InvalidKey`] if `workflow_name`
+    /// or `instance_id` contains `/`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// # let invocation = engine.invoke("wf").await?;
+    /// # let instance_id = invocation.instance_id().to_string();
+    /// // Resume a failed instance — memoised steps are skipped.
+    /// let invocation = engine.resume("wf", &instance_id).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resume(
+        &self,
+        workflow_name: impl Into<String>,
+        instance_id: impl Into<String>,
+    ) -> Result<Invocation, EngineError> {
+        let workflow_name = workflow_name.into();
+        let instance_id = instance_id.into();
+        validate_key_component(&workflow_name, "workflow_name")?;
+        validate_key_component(&instance_id, "instance_id")?;
+        self.spawn_workflow(&workflow_name, instance_id, None).await
+    }
+
+    /// Delivers a signal payload to a suspended workflow step.
+    ///
+    /// Writes the payload as a completed step entry, then resumes the
+    /// workflow. The resumed workflow replays memoised steps, finds the
+    /// now-completed suspend entry, and continues execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::NotStarted`] if the engine has not been started,
+    /// [`EngineError::WorkflowNotFound`] if no workflow is registered under
+    /// the given name, [`EngineError::InvalidKey`] if any component contains
+    /// `/`, [`EngineError::SignalRejected`] if the step does not exist or is
+    /// not currently suspended, [`EngineError::SignalSuperseded`] if another
+    /// caller already claimed the step, or [`EngineError::Storage`] /
+    /// [`EngineError::Serialization`] if the write fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, SuspendPoint, WorkflowState};
+    /// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
+    ///
+    /// async fn approval(ctx: Context) -> Result<(), EngineError> {
+    ///     let approved: bool = ctx.suspend(&APPROVAL).await?;
+    ///     assert!(approved);
+    ///     Ok(())
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut engine = Engine::builder().in_memory().build();
+    /// engine.register("approval", approval);
+    /// engine.start().await?;
+    ///
+    /// let inv = engine.invoke("approval").await?;
+    /// let id = inv.instance_id().to_string();
+    /// inv.wait().await;
+    ///
+    /// let state = engine.signal("approval", &id, &APPROVAL, true).await?.wait().await;
+    /// assert_eq!(state, WorkflowState::Completed(None));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn signal<T>(
+        &self,
+        workflow_name: &str,
+        instance_id: &str,
+        point: &SuspendPoint<T>,
+        payload: T,
+    ) -> Result<Invocation, EngineError>
+    where
+        T: Serialize + DeserializeOwned + Send,
+    {
+        validate_key_component(workflow_name, "workflow_name")?;
+        validate_key_component(instance_id, "instance_id")?;
+
+        let step_key = point.key();
+        let data: StepData<T> = StepData::Completed {
+            result: payload,
+            status: None,
+        };
+        let step_bytes = serialize_step(&data, step_key)?;
+
+        claim_suspended_step(&self.db, workflow_name, instance_id, step_key, &step_bytes)?;
+
+        info!(
+            workflow = workflow_name,
+            instance = instance_id,
+            step = step_key,
+            "signal delivered"
+        );
+
+        let mut tasks = self.tasks.lock().await;
+
+        if !self.running.load(Ordering::Acquire) {
+            return Err(EngineError::NotStarted);
+        }
+
+        let workflow = self
+            .workflows
+            .get(workflow_name)
+            .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
+
+        let tx = self.get_or_create_sender(instance_id);
+        let rx = tx.subscribe();
+
+        spawn_workflow_task(
+            &mut tasks,
+            workflow,
+            &self.db,
+            workflow_name,
+            instance_id,
+            &self.timer_serial,
+            self.default_retry.clone(),
+            &tx,
+            &self.senders,
+        );
+
+        Ok(Invocation {
+            instance_id: instance_id.to_string(),
+            status: rx,
+        })
+    }
+
+    /// Subscribes to status updates for a workflow instance.
+    ///
+    /// Returns a [`StatusStream`] that immediately yields the current state,
+    /// then yields each subsequent state change. The stream ends when the
+    /// workflow completes, fails, or is replaced by a new run (e.g. after
+    /// [`signal`](Engine::signal)).
+    ///
+    /// When no live sender exists (e.g. after a server restart), falls back
+    /// to persisted metadata and returns a single-item stream with the last
+    /// known state.
+    ///
+    /// Returns `None` if the instance has never existed or has stale
+    /// `Running` metadata from a crash.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// let inv = engine.invoke("wf").await?;
+    /// let id = inv.instance_id().to_string();
+    ///
+    /// let stream = engine.subscribe("wf", &id).expect("live instance");
+    /// // Use with StreamExt::next(), .map(), .take_while(), etc.
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn subscribe(&self, workflow_name: &str, instance_id: &str) -> Option<StatusStream> {
+        let senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = senders.get(instance_id) {
+            return Some(StatusStream::live(tx.subscribe()));
+        }
+        drop(senders);
+
+        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id).ok()??;
+        match meta.status() {
+            MetadataStatus::Suspended { key, status } => {
+                Some(StatusStream::snapshot(WorkflowState::Suspended {
+                    key: key.clone(),
+                    status: status.clone(),
+                }))
+            }
+            MetadataStatus::Completed(msg) => Some(StatusStream::snapshot(
+                WorkflowState::Completed(msg.clone()),
+            )),
+            MetadataStatus::Failed(msg) => {
+                Some(StatusStream::snapshot(WorkflowState::Failed(msg.clone())))
+            }
+            MetadataStatus::Running => None,
+        }
+    }
+
+    /// Returns the metadata for a specific workflow instance.
+    ///
+    /// Returns `None` if no instance with the given name and ID exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Storage`] or [`EngineError::Serialization`]
+    /// if the database read fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, MetadataStatus};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// let inv = engine.invoke("wf").await?;
+    /// let id = inv.instance_id().to_string();
+    /// inv.wait().await;
+    ///
+    /// let meta = engine.get_metadata("wf", &id)?.expect("instance exists");
+    /// assert_eq!(*meta.status(), MetadataStatus::Completed(None));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_metadata(
+        &self,
+        workflow_name: &str,
+        instance_id: &str,
+    ) -> Result<Option<WorkflowMetadata>, EngineError> {
+        metadata::read_metadata(&self.db, workflow_name, instance_id)
+    }
+
+    /// Lists all instances of a workflow definition.
+    ///
+    /// Returns `(instance_id, metadata)` pairs for every instance whose
+    /// composite key starts with `"{workflow_name}/"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::Storage`] or [`EngineError::Serialization`]
+    /// if the database read fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// engine.invoke("wf").await?.wait().await;
+    /// engine.invoke("wf").await?.wait().await;
+    ///
+    /// let instances = engine.list_instances("wf")?;
+    /// assert_eq!(instances.len(), 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn list_instances(
+        &self,
+        workflow_name: &str,
+    ) -> Result<Vec<(String, WorkflowMetadata)>, EngineError> {
+        metadata::list_metadata(&self.db, workflow_name)
+    }
+
+    /// Stops the engine, preventing new workflow invocations.
+    ///
+    /// Running workflows continue to completion. To wait for all running
+    /// workflows to finish, use [`wait_all`](Engine::wait_all) instead.
+    #[expect(clippy::unused_async)]
+    pub async fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        info!("engine stopped");
+    }
+
+    /// Waits for all running workflows to complete and prevents new
+    /// invocations.
+    ///
+    /// Sets the engine to a stopped state, then drains all spawned
+    /// workflow tasks. Any call to [`invoke`](Engine::invoke) or
+    /// [`resume`](Engine::resume) after `wait_all` is called will return
+    /// [`EngineError::NotStarted`].
+    ///
+    /// Returns immediately if no workflows are running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn greet(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("greet", greet);
+    /// # engine.start().await?;
+    /// // Fire-and-forget — no need to hold the Invocation handle.
+    /// let _ = engine.invoke("greet").await?;
+    /// let _ = engine.invoke("greet").await?;
+    ///
+    /// // All workflows will have completed when this returns.
+    /// engine.wait_all().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn wait_all(&self) {
+        self.running.store(false, Ordering::Release);
+        info!("waiting for all workflows to complete");
+        let mut tasks = self.tasks.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                if e.is_panic() {
+                    error!("workflow task panicked: {e}");
+                }
+            }
+        }
+        info!("all workflows completed");
+    }
+
+    pub(super) async fn spawn_workflow(
+        &self,
+        workflow_name: &str,
+        instance_id: String,
+        input_bytes: Option<Vec<u8>>,
+    ) -> Result<Invocation, EngineError> {
+        validate_key_component(workflow_name, "workflow_name")?;
+        let mut tasks = self.tasks.lock().await;
+
+        if !self.running.load(Ordering::Acquire) {
+            return Err(EngineError::NotStarted);
+        }
+
+        let workflow = self
+            .workflows
+            .get(workflow_name)
+            .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
+
+        let meta = WorkflowMetadata::new(MetadataStatus::Running);
+        let meta_key = format!("{workflow_name}/{instance_id}");
+        let meta_bytes = postcard::to_allocvec(&meta).map_err(|e| EngineError::Serialization {
+            key: meta_key.clone(),
+            source: Box::new(e),
+        })?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta_table = write_txn.open_table(WORKFLOW_META)?;
+            meta_table.insert(meta_key.as_str(), meta_bytes.as_slice())?;
+
+            if let Some(ref input) = input_bytes {
+                let mut steps_table = write_txn.open_table(STEPS)?;
+                let input_key = format!("{workflow_name}/{instance_id}/_input");
+                steps_table.insert(input_key.as_str(), input.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+
+        let tx = self.get_or_create_sender(&instance_id);
+        let rx = tx.subscribe();
+
+        spawn_workflow_task(
+            &mut tasks,
+            workflow,
+            &self.db,
+            workflow_name,
+            &instance_id,
+            &self.timer_serial,
+            self.default_retry.clone(),
+            &tx,
+            &self.senders,
+        );
+
+        Ok(Invocation {
+            instance_id,
+            status: rx,
+        })
+    }
+
+    fn get_or_create_sender(&self, instance_id: &str) -> watch::Sender<WorkflowState> {
+        let mut senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = senders.get(instance_id) {
+            tx.send_if_modified(|state| {
+                *state = WorkflowState::Started;
+                false
+            });
+            return tx.clone();
+        }
+        let (tx, _) = watch::channel(WorkflowState::Started);
+        senders.insert(instance_id.to_string(), tx.clone());
+        tx
+    }
+}

@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance_id = inv.instance_id().to_string();
     let state = inv.wait().await;
     println!("State: {state}");
-    assert!(matches!(state, WorkflowState::Suspended(_)));
+    assert!(matches!(state, WorkflowState::Suspended { .. }));
 
     // The metadata table shows the workflow is suspended with timer info.
     let meta = engine
@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("instance exists");
         if meta.status().is_terminal() {
             println!("State: {}", meta.status());
-            assert_eq!(*meta.status(), MetadataStatus::Completed);
+            assert_eq!(*meta.status(), MetadataStatus::Completed(None));
             break;
         }
     }
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Resuming (all steps memoised) ===");
     let state = engine.resume("pipeline", &instance_id).await?.wait().await;
     println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed);
+    assert_eq!(state, WorkflowState::Completed(None));
 
     engine.stop().await;
     Ok(())

@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Resume (fetch re-executes, succeeds) ===");
     let state = engine.resume("pipeline", &id).await?.wait().await;
     println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed);
+    assert_eq!(state, WorkflowState::Completed(None));
 
     // The fetch step ran twice total (timed out + retry).
     println!("Fetch attempts: {}", FETCH_ATTEMPTS.load(Ordering::Relaxed));

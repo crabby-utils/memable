@@ -31,7 +31,7 @@
 //! engine.start().await?;
 //!
 //! let state = engine.invoke("greet").await?.wait().await;
-//! assert_eq!(state, WorkflowState::Completed);
+//! assert_eq!(state, WorkflowState::Completed(None));
 //! # Ok(())
 //! # }
 //! ```
@@ -64,7 +64,7 @@
 //! engine.start().await?;
 //!
 //! let state = engine.invoke("fetch").await?.wait().await;
-//! assert_eq!(state, WorkflowState::Completed);
+//! assert_eq!(state, WorkflowState::Completed(None));
 //! # Ok(())
 //! # }
 //! ```
@@ -96,7 +96,7 @@ mod metadata;
 mod retry;
 mod stream;
 
-pub use context::{Context, StepBuilder, SuspendBuilder};
+pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint};
 pub use engine::{
     Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, WorkflowState,
 };

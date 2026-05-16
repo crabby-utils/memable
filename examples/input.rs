@@ -31,11 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed);
+    assert_eq!(state, WorkflowState::Completed(None));
 
     // Invoke without input — the workflow falls back to "world".
     let state = engine.invoke("greet").await?.wait().await;
-    assert_eq!(state, WorkflowState::Completed);
+    assert_eq!(state, WorkflowState::Completed(None));
 
     engine.stop().await;
     Ok(())

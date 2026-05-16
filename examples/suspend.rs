@@ -4,7 +4,12 @@
 //! in-memory state, and later resume when an external signal delivers
 //! a payload. Memoised steps before the suspend point are not re-executed.
 
-use memable::{Context, Engine, EngineError, MetadataStatus, WorkflowState};
+use memable::{Context, Engine, EngineError, MetadataStatus, SuspendPoint, WorkflowState};
+
+/// Typed suspend point — encodes both the key and payload type at compile time.
+/// Both the workflow and the signal call reference this same const, ensuring
+/// they can never disagree on the key string or payload type.
+const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
 
 /// A workflow that fetches data, suspends for approval, then processes
 /// the approved data.
@@ -23,10 +28,11 @@ async fn approval_workflow(ctx: Context) -> Result<(), EngineError> {
     // drops — nothing is held in memory. The engine records the
     // suspension in redb.
     //
-    // The type parameter (bool) is the expected signal payload type.
-    // When the signal arrives, this line returns the payload value.
+    // The APPROVAL const carries the payload type (bool). Both suspend
+    // and signal reference it, so key typos and type mismatches are
+    // caught at compile time.
     let approved: bool = ctx
-        .suspend("approval:v1")
+        .suspend(&APPROVAL)
         .status("Waiting for manager approval")
         .await?;
 
@@ -68,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Metadata: {}", meta.status());
     assert!(matches!(
         meta.status(),
-        MetadataStatus::Suspended(msg) if msg == "Waiting for manager approval"
+        MetadataStatus::Suspended { status, .. } if status == "Waiting for manager approval"
     ));
     println!();
 
@@ -78,12 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // results, and the suspend step resolves with the signal payload.
     println!("=== Sending approval signal ===");
     let state = engine
-        .signal("approval", &instance_id, "approval:v1", true)
+        .signal("approval", &instance_id, &APPROVAL, true)
         .await?
         .wait()
         .await;
     println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed);
+    assert_eq!(state, WorkflowState::Completed(None));
 
     // After the signal, metadata reflects completion.
     let meta = engine

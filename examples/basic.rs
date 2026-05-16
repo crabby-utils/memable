@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_metadata("greeting", &instance_id)?
         .expect("instance exists");
     println!("Metadata: {} at {:?}", meta.status(), meta.completed_at());
-    assert!(matches!(meta.status(), MetadataStatus::Completed));
+    assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
 
     // list_instances shows all instances of a workflow definition.
     let instances = engine.list_instances("greeting")?;

@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{self, Poll};
 
@@ -49,8 +50,6 @@ type ChangedFuture = Pin<
     >,
 >;
 
-use std::future::Future;
-
 enum Inner {
     Live(LiveState),
     Snapshot(Option<WorkflowState>),
@@ -96,7 +95,7 @@ impl StatusStream {
     /// # inv.wait().await;
     /// let mut stream = engine.subscribe("wf", &id).unwrap();
     /// let state = stream.next().await;
-    /// assert_eq!(state, Some(WorkflowState::Completed));
+    /// assert_eq!(state, Some(WorkflowState::Completed(None)));
     /// # Ok(())
     /// # }
     /// ```
@@ -118,9 +117,8 @@ impl Stream for StatusStream {
                         *state = LiveState::Idle(rx);
                         return Poll::Ready(Some(value));
                     }
-                    LiveState::Idle(rx) => {
+                    LiveState::Idle(mut rx) => {
                         let fut = Box::pin(async move {
-                            let mut rx = rx;
                             let result = rx.changed().await;
                             (result, rx)
                         });
