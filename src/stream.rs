@@ -38,21 +38,35 @@ pub struct StatusStream {
     inner: Inner,
 }
 
+type ChangedFuture = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Result<(), watch::error::RecvError>,
+                    watch::Receiver<WorkflowState>,
+                ),
+            > + Send,
+    >,
+>;
+
+use std::future::Future;
+
 enum Inner {
-    Live {
-        rx: watch::Receiver<WorkflowState>,
-        initial_pending: bool,
-    },
+    Live(LiveState),
     Snapshot(Option<WorkflowState>),
+}
+
+enum LiveState {
+    Initial(watch::Receiver<WorkflowState>),
+    Idle(watch::Receiver<WorkflowState>),
+    Waiting(ChangedFuture),
+    Transitioning,
 }
 
 impl StatusStream {
     pub(crate) fn live(rx: watch::Receiver<WorkflowState>) -> Self {
         Self {
-            inner: Inner::Live {
-                rx,
-                initial_pending: true,
-            },
+            inner: Inner::Live(LiveState::Initial(rx)),
         }
     }
 
@@ -97,25 +111,38 @@ impl Stream for StatusStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match &mut this.inner {
-            Inner::Live {
-                rx,
-                initial_pending,
-            } => {
-                if *initial_pending {
-                    *initial_pending = false;
-                    return Poll::Ready(Some(rx.borrow_and_update().clone()));
+            Inner::Live(state) => loop {
+                match std::mem::replace(state, LiveState::Transitioning) {
+                    LiveState::Initial(mut rx) => {
+                        let value = rx.borrow_and_update().clone();
+                        *state = LiveState::Idle(rx);
+                        return Poll::Ready(Some(value));
+                    }
+                    LiveState::Idle(rx) => {
+                        let fut = Box::pin(async move {
+                            let mut rx = rx;
+                            let result = rx.changed().await;
+                            (result, rx)
+                        });
+                        *state = LiveState::Waiting(fut);
+                    }
+                    LiveState::Waiting(mut fut) => match fut.as_mut().poll(cx) {
+                        Poll::Ready((Ok(()), mut rx)) => {
+                            let value = rx.borrow_and_update().clone();
+                            *state = LiveState::Idle(rx);
+                            return Poll::Ready(Some(value));
+                        }
+                        Poll::Ready((Err(_), _)) => {
+                            return Poll::Ready(None);
+                        }
+                        Poll::Pending => {
+                            *state = LiveState::Waiting(fut);
+                            return Poll::Pending;
+                        }
+                    },
+                    LiveState::Transitioning => unreachable!(),
                 }
-                let result = {
-                    let changed = rx.changed();
-                    tokio::pin!(changed);
-                    changed.poll(cx)
-                };
-                match result {
-                    Poll::Ready(Ok(())) => Poll::Ready(Some(rx.borrow_and_update().clone())),
-                    Poll::Ready(Err(_)) => Poll::Ready(None),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
+            },
             Inner::Snapshot(state) => Poll::Ready(state.take()),
         }
     }
