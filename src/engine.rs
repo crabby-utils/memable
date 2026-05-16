@@ -12,7 +12,7 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
-use tracing::{error, info, info_span};
+use tracing::{error, info, info_span, warn};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -365,6 +365,7 @@ fn generate_instance_id() -> String {
 pub struct EngineBuilder<S = NoStore> {
     store: S,
     default_retry: Option<RetryPolicy>,
+    resume_on_start: bool,
 }
 
 /// Typestate: no storage backend configured yet.
@@ -398,6 +399,7 @@ impl EngineBuilder<NoStore> {
         EngineBuilder {
             store: HasStore(db),
             default_retry: self.default_retry,
+            resume_on_start: self.resume_on_start,
         }
     }
 
@@ -425,6 +427,7 @@ impl EngineBuilder<NoStore> {
         Ok(EngineBuilder {
             store: HasStore(db),
             default_retry: self.default_retry,
+            resume_on_start: self.resume_on_start,
         })
     }
 
@@ -448,6 +451,30 @@ impl EngineBuilder<NoStore> {
     #[must_use]
     pub fn default_retry(mut self, policy: RetryPolicy) -> Self {
         self.default_retry = Some(policy);
+        self
+    }
+
+    /// Controls whether `Running` workflow instances are automatically
+    /// resumed when the engine starts.
+    ///
+    /// Defaults to `true`. When enabled, [`Engine::start`] scans the
+    /// metadata table for instances that were `Running` when the process
+    /// last exited and resumes them. `Suspended` instances are not
+    /// affected — they continue to wait for their signal or timer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .resume_on_start(false)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn resume_on_start(mut self, enabled: bool) -> Self {
+        self.resume_on_start = enabled;
         self
     }
 }
@@ -476,6 +503,30 @@ impl EngineBuilder<HasStore> {
         self
     }
 
+    /// Controls whether `Running` workflow instances are automatically
+    /// resumed when the engine starts.
+    ///
+    /// Defaults to `true`. When enabled, [`Engine::start`] scans the
+    /// metadata table for instances that were `Running` when the process
+    /// last exited and resumes them. `Suspended` instances are not
+    /// affected — they continue to wait for their signal or timer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .resume_on_start(false)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn resume_on_start(mut self, enabled: bool) -> Self {
+        self.resume_on_start = enabled;
+        self
+    }
+
     /// Builds the engine.
     ///
     /// This method is only available after a storage backend has been
@@ -490,6 +541,7 @@ impl EngineBuilder<HasStore> {
             tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
             timer_serial: Arc::new(AtomicU64::new(0)),
             default_retry: self.default_retry,
+            resume_on_start: self.resume_on_start,
             senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -541,6 +593,7 @@ pub struct Engine {
     tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
     timer_serial: Arc<AtomicU64>,
     default_retry: Option<RetryPolicy>,
+    resume_on_start: bool,
     senders: Senders,
 }
 
@@ -559,6 +612,7 @@ impl Engine {
         EngineBuilder {
             store: NoStore,
             default_retry: None,
+            resume_on_start: true,
         }
     }
 
@@ -610,6 +664,11 @@ impl Engine {
     /// actual firing latency is up to ~1 second after the deadline.
     /// Must be called after all workflows are registered.
     ///
+    /// When [`EngineBuilder::resume_on_start`] is enabled (the default),
+    /// scans the metadata table and resumes any instances that were
+    /// `Running` when the process last exited. `Suspended` instances are
+    /// not resumed — they continue to wait for their signal or timer.
+    ///
     /// # Errors
     ///
     /// Returns [`EngineError`] if startup fails.
@@ -655,7 +714,44 @@ impl Engine {
             .instrument(info_span!("timer_poller")),
         );
 
+        drop(tasks);
+
+        if self.resume_on_start {
+            self.resume_running_instances().await?;
+        }
+
         info!("engine started");
+        Ok(())
+    }
+
+    async fn resume_running_instances(&self) -> Result<(), EngineError> {
+        let workflow_names: Vec<String> = self.workflows.keys().cloned().collect();
+        for workflow_name in &workflow_names {
+            let instances = metadata::list_metadata(&self.db, workflow_name)?;
+            for (instance_id, meta) in instances {
+                if *meta.status() == MetadataStatus::Running {
+                    info!(
+                        workflow = %workflow_name,
+                        instance_id = %instance_id,
+                        "auto-resuming workflow instance"
+                    );
+                    match self
+                        .spawn_workflow(workflow_name, instance_id.clone(), None)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                workflow = %workflow_name,
+                                instance_id = %instance_id,
+                                error = %e,
+                                "failed to auto-resume workflow instance, skipping"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3783,5 +3879,133 @@ mod tests {
         let mut stream = engine.subscribe("wf", &id).unwrap();
         assert_eq!(stream.next().await, Some(WorkflowState::Completed));
         assert_eq!(stream.next().await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_running_instances_on_start() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Seed the DB with a Running instance (simulates a crash mid-flight).
+        {
+            let db = redb::Database::create(&path).unwrap();
+            metadata::write_metadata(
+                &db,
+                "wf",
+                "crashed-instance",
+                &WorkflowMetadata::new(MetadataStatus::Running),
+            )
+            .unwrap();
+        }
+
+        // New engine on the same DB — auto-resume should pick it up.
+        let exec_count = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&exec_count);
+        let mut engine = Engine::builder().open(&path).unwrap().build();
+        engine.register("wf", move |ctx: Context| {
+            let c = Arc::clone(&c);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .run(async move || {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Ok(42)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(exec_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_on_start_false_skips_recovery() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Write a Running instance directly.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            metadata::write_metadata(
+                &db,
+                "wf",
+                "orphan",
+                &WorkflowMetadata::new(MetadataStatus::Running),
+            )
+            .unwrap();
+        }
+
+        let exec_count = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&exec_count);
+        let mut engine = Engine::builder()
+            .open(&path)
+            .unwrap()
+            .resume_on_start(false)
+            .build();
+        engine.register("wf", move |ctx: Context| {
+            let c = Arc::clone(&c);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .run(async move || {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Ok(1)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(exec_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_resume_skips_suspended_instances() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Write a Suspended instance — should NOT be auto-resumed.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            metadata::write_metadata(
+                &db,
+                "wf",
+                "waiting",
+                &WorkflowMetadata::new(MetadataStatus::Suspended("awaiting approval".to_string())),
+            )
+            .unwrap();
+        }
+
+        let exec_count = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&exec_count);
+        let mut engine = Engine::builder().open(&path).unwrap().build();
+        engine.register("wf", move |ctx: Context| {
+            let c = Arc::clone(&c);
+            async move {
+                let _: i32 = ctx
+                    .step("s1")
+                    .run(async move || {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        Ok(1)
+                    })
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        assert_eq!(exec_count.load(Ordering::Relaxed), 0);
     }
 }
