@@ -96,7 +96,9 @@ mod metadata;
 mod retry;
 
 pub use context::{Context, StepBuilder, SuspendBuilder};
-pub use engine::{Engine, EngineBuilder, Invocation, WorkflowState};
+pub use engine::{
+    Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, WorkflowState,
+};
 pub use error::{EngineError, StepError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};
 pub use retry::RetryPolicy;

@@ -204,6 +204,55 @@ impl Context {
         &self.instance_id
     }
 
+    /// Reads the typed input payload provided at invocation time.
+    ///
+    /// Returns `Ok(Some(T))` when input was supplied via
+    /// [`InvocationBuilder::input`](crate::InvocationBuilder::input),
+    /// `Ok(None)` when the workflow was invoked without input,
+    /// or `Err` on type mismatch / deserialization failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::TypeMismatch`] if the stored type does not
+    /// match `T`. Returns [`EngineError::Serialization`] on deserialization
+    /// failure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::{Engine, Context, EngineError, WorkflowState};
+    ///
+    /// async fn greet(ctx: Context) -> Result<(), EngineError> {
+    ///     let name: String = ctx.input::<String>()?.unwrap_or("world".into());
+    ///     let msg: String = ctx.step("greet:v1").run(async move || {
+    ///         Ok(format!("Hello, {name}!"))
+    ///     }).await?;
+    ///     Ok(())
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut engine = Engine::builder().in_memory().build();
+    /// engine.register("greet", greet);
+    /// engine.start().await?;
+    ///
+    /// let state = engine.invoke("greet").input("Alice".to_string()).await?.wait().await;
+    /// assert_eq!(state, WorkflowState::Completed);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn input<T: DeserializeOwned>(&self) -> Result<Option<T>, EngineError> {
+        let composite_key = format!("{}/{}/_input", self.workflow_name, self.instance_id);
+        let Some(bytes) = self.read_step(&composite_key)? else {
+            return Ok(None);
+        };
+        let data: StepData<T> = deserialize_step(&bytes, "_input")?;
+        match data {
+            StepData::Completed { result, .. } => Ok(Some(result)),
+            StepData::Suspended | StepData::Failed { .. } => Ok(None),
+        }
+    }
+
     /// Updates the workflow's observable status.
     ///
     /// Sets the [`WorkflowState`] to [`InProgress`](WorkflowState::InProgress)
@@ -259,7 +308,8 @@ impl Context {
     ///
     /// # Panics
     ///
-    /// Panics if `key` contains the `/` delimiter.
+    /// Panics if `key` contains `/` or starts with `_` (reserved for
+    /// engine use).
     ///
     /// # Examples
     ///
@@ -295,6 +345,10 @@ impl Context {
     #[must_use]
     pub fn step<'a>(&'a self, key: &'a str) -> StepBuilder<'a> {
         assert!(!key.contains('/'), "step key must not contain '/': '{key}'");
+        assert!(
+            !key.starts_with('_'),
+            "step keys starting with '_' are reserved: '{key}'"
+        );
         StepBuilder {
             ctx: self,
             key,
@@ -319,7 +373,8 @@ impl Context {
     ///
     /// # Panics
     ///
-    /// Panics if `key` contains the `/` delimiter.
+    /// Panics if `key` contains `/` or starts with `_` (reserved for
+    /// engine use).
     ///
     /// # Errors
     ///
@@ -350,6 +405,10 @@ impl Context {
             !key.contains('/'),
             "suspend key must not contain '/': '{key}'"
         );
+        assert!(
+            !key.starts_with('_'),
+            "suspend keys starting with '_' are reserved: '{key}'"
+        );
         SuspendBuilder {
             ctx: self,
             key,
@@ -372,7 +431,8 @@ impl Context {
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::InvalidKey`] if `key` contains `/`.
+    /// Returns [`EngineError::InvalidKey`] if `key` contains `/` or starts
+    /// with `_` (reserved for engine use).
     /// Returns [`EngineError::Suspended`] when the timer is first set.
     /// Returns [`EngineError::Storage`] or [`EngineError::Serialization`]
     /// on storage failures.
@@ -395,7 +455,7 @@ impl Context {
     /// }
     /// ```
     pub fn timer(&self, key: &str, duration: Duration) -> Result<(), EngineError> {
-        if key.contains('/') {
+        if key.contains('/') || key.starts_with('_') {
             return Err(EngineError::InvalidKey {
                 label: "step_key",
                 value: key.to_string(),

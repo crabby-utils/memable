@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::hash::{BuildHasher as _, RandomState};
 use std::path::Path;
 use std::pin::Pin;
@@ -235,6 +235,92 @@ impl Invocation {
     }
 }
 
+/// Builder for invoking a workflow with optional typed input.
+///
+/// Created by [`Engine::invoke`]. Call [`.input(payload)`](Self::input) to
+/// attach data the workflow can read via [`Context::input`], then `.await`
+/// the builder to start the workflow.
+///
+/// # Examples
+///
+/// ```
+/// use memable::{Engine, Context, EngineError, WorkflowState};
+///
+/// async fn greet(ctx: Context) -> Result<(), EngineError> {
+///     let name: String = ctx.input::<String>()?.unwrap_or("world".into());
+///     Ok(())
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut engine = Engine::builder().in_memory().build();
+/// engine.register("greet", greet);
+/// engine.start().await?;
+///
+/// // Without input:
+/// let inv = engine.invoke("greet").await?;
+///
+/// // With typed input:
+/// let inv = engine.invoke("greet").input("Alice".to_string()).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct InvocationBuilder<'a> {
+    engine: &'a Engine,
+    workflow_name: String,
+    input_payload: Result<Option<Vec<u8>>, EngineError>,
+}
+
+impl InvocationBuilder<'_> {
+    /// Attaches a typed input payload to the workflow invocation.
+    ///
+    /// The payload is serialized immediately and stored as a step entry
+    /// with the reserved key `_input` before the workflow task spawns.
+    /// The workflow reads it via [`Context::input`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// #     let val: i32 = ctx.input::<i32>()?.unwrap();
+    /// #     assert_eq!(val, 42);
+    /// #     Ok(())
+    /// # }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// let inv = engine.invoke("wf").input(42_i32).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn input<T: Serialize>(mut self, payload: T) -> Self {
+        let data: StepData<T> = StepData::Completed {
+            result: payload,
+            status: None,
+        };
+        self.input_payload = serialize_step(&data, "_input").map(Some);
+        self
+    }
+}
+
+impl<'a> IntoFuture for InvocationBuilder<'a> {
+    type Output = Result<Invocation, EngineError>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let input_bytes = self.input_payload?;
+            self.engine
+                .spawn_workflow(&self.workflow_name, generate_instance_id(), input_bytes)
+                .await
+        })
+    }
+}
+
 /// Type-erased workflow function.
 type WorkflowFn = Arc<
     dyn Fn(Context) -> Pin<Box<dyn Future<Output = Result<(), EngineError>> + Send>> + Send + Sync,
@@ -261,6 +347,10 @@ fn generate_instance_id() -> String {
 
 /// Builder for configuring and constructing an [`Engine`].
 ///
+/// Uses a typestate pattern: [`build`](EngineBuilder::build) is only available
+/// after a storage backend has been configured via [`in_memory`](EngineBuilder::in_memory)
+/// or [`open`](EngineBuilder::open).
+///
 /// # Examples
 ///
 /// ```
@@ -268,12 +358,22 @@ fn generate_instance_id() -> String {
 ///
 /// let engine = Engine::builder().in_memory().build();
 /// ```
-pub struct EngineBuilder {
-    db: Option<Database>,
+pub struct EngineBuilder<S = NoStore> {
+    store: S,
     default_retry: Option<RetryPolicy>,
 }
 
-impl EngineBuilder {
+/// Typestate: no storage backend configured yet.
+///
+/// Call [`EngineBuilder::in_memory`] or [`EngineBuilder::open`] to proceed.
+#[doc(hidden)]
+pub struct NoStore;
+
+/// Typestate: storage backend has been configured.
+#[doc(hidden)]
+pub struct HasStore(Database);
+
+impl EngineBuilder<NoStore> {
     /// Uses an in-memory store (no data survives process exit).
     ///
     /// Ideal for tests and short-lived workflows.
@@ -287,12 +387,14 @@ impl EngineBuilder {
     /// ```
     #[must_use]
     #[expect(clippy::missing_panics_doc)]
-    pub fn in_memory(mut self) -> Self {
+    pub fn in_memory(self) -> EngineBuilder<HasStore> {
         let db = Database::builder()
             .create_with_backend(InMemoryBackend::new())
             .expect("in-memory database creation should not fail");
-        self.db = Some(db);
-        self
+        EngineBuilder {
+            store: HasStore(db),
+            default_retry: self.default_retry,
+        }
     }
 
     /// Uses a file-backed store at `path` for durable persistence.
@@ -314,12 +416,39 @@ impl EngineBuilder {
     ///     .expect("failed to open database")
     ///     .build();
     /// ```
-    pub fn open(mut self, path: impl AsRef<Path>) -> Result<Self, EngineError> {
+    pub fn open(self, path: impl AsRef<Path>) -> Result<EngineBuilder<HasStore>, EngineError> {
         let db = Database::create(path)?;
-        self.db = Some(db);
-        Ok(self)
+        Ok(EngineBuilder {
+            store: HasStore(db),
+            default_retry: self.default_retry,
+        })
     }
 
+    /// Sets a default retry policy for all steps.
+    ///
+    /// Individual steps can override this with
+    /// [`StepBuilder::retry`](crate::StepBuilder::retry) or disable it
+    /// with [`StepBuilder::no_retry`](crate::StepBuilder::no_retry).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::{Engine, RetryPolicy};
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .default_retry(RetryPolicy::exponential(3, Duration::from_secs(1)))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn default_retry(mut self, policy: RetryPolicy) -> Self {
+        self.default_retry = Some(policy);
+        self
+    }
+}
+
+impl EngineBuilder<HasStore> {
     /// Sets a default retry policy for all steps.
     ///
     /// Individual steps can override this with
@@ -345,17 +474,13 @@ impl EngineBuilder {
 
     /// Builds the engine.
     ///
-    /// # Panics
-    ///
-    /// Panics if no store was configured (call [`in_memory`](EngineBuilder::in_memory)
-    /// or [`open`](EngineBuilder::open) first).
+    /// This method is only available after a storage backend has been
+    /// configured via [`in_memory`](EngineBuilder::in_memory) or
+    /// [`open`](EngineBuilder::open).
     #[must_use]
     pub fn build(self) -> Engine {
-        let db = self
-            .db
-            .expect("Engine::builder() requires .in_memory() or .open(path) before .build()");
         Engine {
-            db: Arc::new(db),
+            db: Arc::new(self.store.0),
             workflows: HashMap::new(),
             running: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
@@ -424,9 +549,9 @@ impl Engine {
     /// let engine = Engine::builder().in_memory().build();
     /// ```
     #[must_use]
-    pub fn builder() -> EngineBuilder {
+    pub fn builder() -> EngineBuilder<NoStore> {
         EngineBuilder {
-            db: None,
+            store: NoStore,
             default_retry: None,
         }
     }
@@ -528,16 +653,19 @@ impl Engine {
 
     /// Invokes a registered workflow, creating a new instance.
     ///
+    /// Returns an [`InvocationBuilder`] that can be awaited directly or
+    /// chained with [`.input(payload)`](InvocationBuilder::input) to pass
+    /// typed data the workflow reads via [`Context::input`].
+    ///
     /// A unique instance ID is generated automatically. The workflow runs
-    /// in a spawned Tokio task. Returns an [`Invocation`] handle with the
-    /// instance ID and a status channel.
+    /// in a spawned Tokio task.
     ///
     /// # Errors
     ///
-    /// Returns [`EngineError::NotStarted`] if the engine has not been started,
-    /// [`EngineError::WorkflowNotFound`] if no workflow is registered
-    /// under the given name, or [`EngineError::InvalidKey`] if the name
-    /// contains `/`.
+    /// The returned builder yields [`EngineError::NotStarted`] if the engine
+    /// has not been started, [`EngineError::WorkflowNotFound`] if no workflow
+    /// is registered under the given name, or [`EngineError::InvalidKey`] if
+    /// the name contains `/`.
     ///
     /// # Examples
     ///
@@ -549,19 +677,22 @@ impl Engine {
     /// # let mut engine = Engine::builder().in_memory().build();
     /// # engine.register("greet", greet);
     /// # engine.start().await?;
+    /// // Without input:
     /// let invocation = engine.invoke("greet").await?;
     /// println!("Started instance {}", invocation.instance_id());
+    ///
+    /// // With input:
+    /// let invocation = engine.invoke("greet").input(42_i32).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn invoke(
-        &self,
-        workflow_name: impl Into<String>,
-    ) -> Result<Invocation, EngineError> {
-        let instance_id = generate_instance_id();
-        let workflow_name = workflow_name.into();
-        validate_key_component(&workflow_name, "workflow_name")?;
-        self.spawn_workflow(&workflow_name, instance_id).await
+    #[must_use]
+    pub fn invoke(&self, workflow_name: impl Into<String>) -> InvocationBuilder<'_> {
+        InvocationBuilder {
+            engine: self,
+            workflow_name: workflow_name.into(),
+            input_payload: Ok(None),
+        }
     }
 
     /// Resumes a previously failed or incomplete workflow instance.
@@ -603,7 +734,7 @@ impl Engine {
         let instance_id = instance_id.into();
         validate_key_component(&workflow_name, "workflow_name")?;
         validate_key_component(&instance_id, "instance_id")?;
-        self.spawn_workflow(&workflow_name, instance_id).await
+        self.spawn_workflow(&workflow_name, instance_id, None).await
     }
 
     /// Delivers a signal payload to a suspended workflow step.
@@ -660,6 +791,12 @@ impl Engine {
         validate_key_component(workflow_name, "workflow_name")?;
         validate_key_component(instance_id, "instance_id")?;
         validate_key_component(step_key, "step_key")?;
+        if step_key.starts_with('_') {
+            return Err(EngineError::InvalidKey {
+                label: "step_key",
+                value: step_key.to_string(),
+            });
+        }
 
         let data: StepData<T> = StepData::Completed {
             result: payload,
@@ -826,7 +963,9 @@ impl Engine {
         &self,
         workflow_name: &str,
         instance_id: String,
+        input_bytes: Option<Vec<u8>>,
     ) -> Result<Invocation, EngineError> {
+        validate_key_component(workflow_name, "workflow_name")?;
         let mut tasks = self.tasks.lock().await;
 
         if !self.running.load(Ordering::Acquire) {
@@ -838,12 +977,25 @@ impl Engine {
             .get(workflow_name)
             .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
 
-        metadata::write_metadata(
-            &self.db,
-            workflow_name,
-            &instance_id,
-            &WorkflowMetadata::new(MetadataStatus::Running),
-        )?;
+        let meta = WorkflowMetadata::new(MetadataStatus::Running);
+        let meta_key = format!("{workflow_name}/{instance_id}");
+        let meta_bytes = postcard::to_allocvec(&meta).map_err(|e| EngineError::Serialization {
+            key: meta_key.clone(),
+            source: Box::new(e),
+        })?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut meta_table = write_txn.open_table(WORKFLOW_META)?;
+            meta_table.insert(meta_key.as_str(), meta_bytes.as_slice())?;
+
+            if let Some(ref input) = input_bytes {
+                let mut steps_table = write_txn.open_table(STEPS)?;
+                let input_key = format!("{workflow_name}/{instance_id}/_input");
+                steps_table.insert(input_key.as_str(), input.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
 
         Ok(spawn_workflow_task(
             &mut tasks,
@@ -2468,6 +2620,77 @@ mod tests {
         assert!(matches!(state, WorkflowState::Failed(_)));
     }
 
+    #[test]
+    #[should_panic(expected = "step keys starting with '_' are reserved")]
+    fn step_rejects_reserved_prefix() {
+        let db = Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
+        let (tx, _rx) = watch::channel(WorkflowState::Started);
+        let ctx = Context::new(
+            "wf".into(),
+            "id".into(),
+            db,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+        let _ = ctx.step("_reserved");
+    }
+
+    #[test]
+    #[should_panic(expected = "suspend keys starting with '_' are reserved")]
+    fn suspend_rejects_reserved_prefix() {
+        let db = Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        );
+        let (tx, _rx) = watch::channel(WorkflowState::Started);
+        let ctx = Context::new(
+            "wf".into(),
+            "id".into(),
+            db,
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            None,
+        );
+        let _: SuspendBuilder<'_, bool> = ctx.suspend("_reserved");
+    }
+
+    #[tokio::test]
+    async fn timer_rejects_reserved_prefix() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            ctx.timer("_reserved", Duration::from_secs(1))?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert!(matches!(state, WorkflowState::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn signal_rejects_reserved_prefix() {
+        async fn wf(ctx: Context) -> Result<(), EngineError> {
+            let _: bool = ctx.suspend("wait:v1").await?;
+            Ok(())
+        }
+        let mut engine = test_engine();
+        engine.register("wf", wf);
+        engine.start().await.unwrap();
+
+        let inv = engine.invoke("wf").await.unwrap();
+        let id = inv.instance_id().to_string();
+        inv.wait().await;
+
+        let result = engine.signal("wf", &id, "_reserved", true).await;
+        assert!(matches!(result, Err(EngineError::InvalidKey { .. })));
+    }
+
     #[tokio::test]
     async fn signal_rejects_when_step_does_not_exist() {
         async fn wf(ctx: Context) -> Result<(), EngineError> {
@@ -3096,5 +3319,150 @@ mod tests {
         assert!(
             matches!(state, WorkflowState::Failed(msg) if msg.contains("boom") && !msg.contains("attempts"))
         );
+    }
+
+    // ── input payload tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn invoke_with_input_delivers_payload() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let val: i32 = ctx.input::<i32>()?.unwrap();
+            assert_eq!(val, 42);
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine
+            .invoke("wf")
+            .input(42_i32)
+            .await
+            .unwrap()
+            .wait()
+            .await;
+        assert_eq!(state, WorkflowState::Completed);
+    }
+
+    #[tokio::test]
+    async fn invoke_without_input_backward_compatible() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let _: String = ctx
+                .step("s:v1")
+                .run(async || Ok("hello".to_string()))
+                .await?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert_eq!(state, WorkflowState::Completed);
+    }
+
+    #[tokio::test]
+    async fn input_returns_none_when_not_provided() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let val = ctx.input::<String>()?;
+            assert!(val.is_none());
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine.invoke("wf").await.unwrap().wait().await;
+        assert_eq!(state, WorkflowState::Completed);
+    }
+
+    #[tokio::test]
+    async fn input_type_mismatch() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let _val = ctx.input::<i32>()?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let state = engine
+            .invoke("wf")
+            .input("not an i32".to_string())
+            .await
+            .unwrap()
+            .wait()
+            .await;
+        assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("type mismatch")));
+    }
+
+    #[tokio::test]
+    async fn input_preserved_across_resume() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&call_count);
+
+        let mut engine = test_engine();
+        engine.register("wf", move |ctx: Context| {
+            let c = Arc::clone(&c);
+            async move {
+                let name: String = ctx.input::<String>()?.unwrap();
+                let attempt = c.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    return Err(EngineError::step_failed(
+                        "fail:v1",
+                        "deliberate failure",
+                        false,
+                    ));
+                }
+                let _: String = ctx
+                    .step("greet:v1")
+                    .run(async move || Ok(format!("Hello, {name}!")))
+                    .await?;
+                Ok(())
+            }
+        });
+        engine.start().await.unwrap();
+
+        let inv = engine
+            .invoke("wf")
+            .input("Alice".to_string())
+            .await
+            .unwrap();
+        let id = inv.instance_id().to_string();
+        let state = inv.wait().await;
+        assert!(matches!(state, WorkflowState::Failed(_)));
+
+        let state = engine.resume("wf", &id).await.unwrap().wait().await;
+        assert_eq!(state, WorkflowState::Completed);
+        assert_eq!(call_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn input_coexists_with_suspend_and_signal() {
+        let mut engine = test_engine();
+        engine.register("wf", |ctx: Context| async move {
+            let prefix: String = ctx.input::<String>()?.unwrap();
+            let approval: bool = ctx.suspend("approve:v1").await?;
+            assert!(approval);
+            let _: String = ctx
+                .step("format:v1")
+                .run(async move || Ok(format!("{prefix}: approved")))
+                .await?;
+            Ok(())
+        });
+        engine.start().await.unwrap();
+
+        let inv = engine
+            .invoke("wf")
+            .input("request-1".to_string())
+            .await
+            .unwrap();
+        let id = inv.instance_id().to_string();
+        let state = inv.wait().await;
+        assert!(matches!(state, WorkflowState::Suspended(_)));
+
+        let state = engine
+            .signal("wf", &id, "approve:v1", true)
+            .await
+            .unwrap()
+            .wait()
+            .await;
+        assert_eq!(state, WorkflowState::Completed);
     }
 }
