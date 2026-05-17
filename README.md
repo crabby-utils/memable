@@ -31,7 +31,7 @@ cargo add memable
 
 ## Documentation
 
-[API docs on docs.rs](https://docs.rs/memable/0.1.0/memable/)
+[API docs on docs.rs](https://docs.rs/memable/latest/memable/)
 
 ## Status
 
