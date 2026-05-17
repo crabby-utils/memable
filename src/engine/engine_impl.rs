@@ -19,7 +19,7 @@ use super::execution::{
 use super::invocation::{Invocation, InvocationBuilder};
 use super::{Senders, WorkflowFn, WorkflowState};
 use crate::context::{Context, STEPS, StepData, SuspendPoint, serialize_step};
-use crate::error::{EngineError, SubscribeError};
+use crate::error::{EngineError, StateError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 use crate::retry::RetryPolicy;
 use crate::stream::StatusStream;
@@ -497,6 +497,75 @@ impl Engine {
                     workflow_name: workflow_name.to_string(),
                     instance_id: instance_id.to_string(),
                 }),
+            },
+        }
+    }
+
+    /// Returns the current state of a workflow instance.
+    ///
+    /// Checks the live watch channel first, falling back to persisted
+    /// metadata. This is a single point-in-time read — no stream is
+    /// allocated.
+    ///
+    /// If the instance has stale `Running` metadata (no live task, e.g.
+    /// after a crash), returns [`WorkflowState::Started`] rather than an
+    /// error — the caller sees "was running" rather than needing to handle
+    /// a crash-recovery variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError::NotFound`] if no instance with the given name
+    /// and ID exists, or [`StateError::Storage`] if the database read fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut engine = Engine::builder().in_memory().build();
+    /// # engine.register("wf", wf);
+    /// # engine.start().await?;
+    /// let inv = engine.invoke("wf").await?;
+    /// let id = inv.instance_id().to_string();
+    /// inv.wait().await;
+    ///
+    /// let state = engine.state("wf", &id)?;
+    /// assert_eq!(state, WorkflowState::Completed(None));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn state(
+        &self,
+        workflow_name: &str,
+        instance_id: &str,
+    ) -> Result<WorkflowState, StateError> {
+        let senders = self
+            .senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = senders.get(instance_id) {
+            return Ok(tx.borrow().clone());
+        }
+        drop(senders);
+
+        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id)
+            .map_err(|e| StateError::Storage(e.to_string().into()))?;
+
+        match meta {
+            None => Err(StateError::NotFound {
+                workflow_name: workflow_name.to_string(),
+                instance_id: instance_id.to_string(),
+            }),
+            Some(meta) => match meta.status() {
+                MetadataStatus::Running => Ok(WorkflowState::Started),
+                MetadataStatus::Suspended { key, status } => Ok(WorkflowState::Suspended {
+                    key: key.clone(),
+                    status: status.clone(),
+                }),
+                MetadataStatus::Completed(msg) => Ok(WorkflowState::Completed(msg.clone())),
+                MetadataStatus::Failed(msg) => Ok(WorkflowState::Failed(msg.clone())),
             },
         }
     }

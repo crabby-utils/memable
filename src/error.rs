@@ -314,6 +314,35 @@ pub enum SubscribeError {
     Storage(Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// Error returned by [`Engine::state`](crate::Engine::state).
+///
+/// # Examples
+///
+/// ```
+/// use memable::StateError;
+///
+/// let err = StateError::NotFound {
+///     workflow_name: "etl".into(),
+///     instance_id: "run-42".into(),
+/// };
+/// assert!(err.to_string().contains("etl"));
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum StateError {
+    /// No instance with this workflow name and ID exists.
+    #[error("no instance found for workflow '{workflow_name}' with id '{instance_id}'")]
+    NotFound {
+        /// The workflow name that was queried.
+        workflow_name: String,
+        /// The instance ID that was queried.
+        instance_id: String,
+    },
+
+    /// A storage operation failed while reading metadata.
+    #[error("storage error: {0}")]
+    Storage(Box<dyn std::error::Error + Send + Sync>),
+}
+
 /// Error returned by step closures.
 ///
 /// The variant communicates retry intent to the engine:

@@ -4,7 +4,7 @@ use std::time::Duration;
 use super::*;
 use crate::StepError;
 use crate::context::SuspendPoint;
-use crate::error::SubscribeError;
+use crate::error::{StateError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 
 fn test_engine() -> Engine {
@@ -2540,4 +2540,129 @@ async fn auto_resume_skips_suspended_instances() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     assert_eq!(exec_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn state_returns_completed_for_finished_workflow() {
+    async fn wf(ctx: Context) -> Result<(), EngineError> {
+        let _: i32 = ctx.step("a").run(async || Ok(1)).await?;
+        Ok(())
+    }
+
+    let mut engine = test_engine();
+    engine.register("wf", wf);
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("wf").await.unwrap();
+    let id = inv.instance_id().to_string();
+    inv.wait().await;
+
+    let state = engine.state("wf", &id).unwrap();
+    assert_eq!(state, WorkflowState::Completed(None));
+}
+
+#[tokio::test]
+async fn state_returns_suspended_for_waiting_workflow() {
+    const GATE: SuspendPoint<bool> = SuspendPoint::new("gate:v1");
+
+    async fn wf(ctx: Context) -> Result<(), EngineError> {
+        let _: bool = ctx.suspend(&GATE).await?;
+        Ok(())
+    }
+
+    let mut engine = test_engine();
+    engine.register("wf", wf);
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("wf").await.unwrap();
+    let id = inv.instance_id().to_string();
+    inv.wait().await;
+
+    let state = engine.state("wf", &id).unwrap();
+    assert!(
+        matches!(state, WorkflowState::Suspended { ref key, .. } if key == "gate:v1"),
+        "expected Suspended, got {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn state_returns_failed_for_failed_workflow() {
+    async fn wf(_ctx: Context) -> Result<(), EngineError> {
+        Err(EngineError::step_failed("boom", "kaboom", false))
+    }
+
+    let mut engine = test_engine();
+    engine.register("wf", wf);
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("wf").await.unwrap();
+    let id = inv.instance_id().to_string();
+    inv.wait().await;
+
+    let state = engine.state("wf", &id).unwrap();
+    assert!(
+        matches!(state, WorkflowState::Failed(_)),
+        "expected Failed, got {state:?}"
+    );
+}
+
+#[tokio::test]
+async fn state_returns_not_found_for_missing_instance() {
+    let mut engine = test_engine();
+    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.start().await.unwrap();
+
+    let err = engine.state("wf", "no-such-id").unwrap_err();
+    assert!(
+        matches!(err, StateError::NotFound { .. }),
+        "expected NotFound, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn state_returns_started_for_stale_running() {
+    let mut engine = test_engine();
+    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.start().await.unwrap();
+
+    metadata::write_metadata(
+        &engine.db,
+        "wf",
+        "stale-1",
+        &WorkflowMetadata::new(MetadataStatus::Running),
+    )
+    .unwrap();
+
+    let state = engine.state("wf", "stale-1").unwrap();
+    assert_eq!(state, WorkflowState::Started);
+}
+
+#[tokio::test]
+async fn state_reads_live_sender_while_running() {
+    use tokio::sync::Barrier;
+    let barrier = Arc::new(Barrier::new(2));
+
+    let b = Arc::clone(&barrier);
+    let mut engine = test_engine();
+    engine.register("wf", move |ctx: Context| {
+        let b = Arc::clone(&b);
+        async move {
+            ctx.set_status("working");
+            b.wait().await;
+            Ok(())
+        }
+    });
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("wf").await.unwrap();
+    let id = inv.instance_id().to_string();
+
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let state = engine.state("wf", &id).unwrap();
+    assert_eq!(state, WorkflowState::InProgress("working".into()));
+
+    barrier.wait().await;
+    inv.wait().await;
 }

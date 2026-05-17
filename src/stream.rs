@@ -66,10 +66,11 @@ enum LiveState {
 impl fmt::Debug for StatusStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
-            Inner::Live(_) => f.debug_struct("StatusStream").field("kind", &"live").finish(),
-            Inner::Snapshot(s) => {
-                f.debug_struct("StatusStream").field("snapshot", s).finish()
-            }
+            Inner::Live(_) => f
+                .debug_struct("StatusStream")
+                .field("kind", &"live")
+                .finish(),
+            Inner::Snapshot(s) => f.debug_struct("StatusStream").field("snapshot", s).finish(),
         }
     }
 }
