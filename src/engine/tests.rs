@@ -2666,3 +2666,173 @@ async fn state_reads_live_sender_while_running() {
     barrier.wait().await;
     inv.wait().await;
 }
+
+// ── Graceful shutdown ───────────────────────────────────────────────
+
+#[tokio::test(start_paused = true)]
+async fn stop_waits_for_running_workflows() {
+    let counter = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&counter);
+
+    let mut engine = test_engine();
+    engine.register("wf", move |ctx: Context| {
+        let c = Arc::clone(&c);
+        async move {
+            let _: i32 = ctx
+                .step("x")
+                .run(async move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    Ok(1)
+                })
+                .await?;
+            Ok(())
+        }
+    });
+    engine.start().await.unwrap();
+
+    let _ = engine.invoke("wf").await.unwrap();
+    let _ = engine.invoke("wf").await.unwrap();
+
+    engine.stop().await;
+
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_aborts_after_timeout() {
+    let mut engine = Engine::builder()
+        .in_memory()
+        .shutdown_timeout(Duration::from_millis(100))
+        .build();
+
+    engine.register("stuck", |_ctx: Context| async move {
+        tokio::sync::Notify::new().notified().await;
+        Ok(())
+    });
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("stuck").await.unwrap();
+    let instance_id = inv.instance_id().to_string();
+
+    engine.stop().await;
+
+    let meta = engine
+        .get_metadata("stuck", &instance_id)
+        .unwrap()
+        .expect("instance exists");
+    assert_eq!(*meta.status(), MetadataStatus::Running);
+}
+
+#[tokio::test(start_paused = true)]
+async fn invoke_after_stop_fails() {
+    async fn noop(_ctx: Context) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    let mut engine = test_engine();
+    engine.register("noop", noop);
+    engine.start().await.unwrap();
+
+    engine.stop().await;
+
+    let result = engine.invoke("noop").await;
+    assert!(matches!(result, Err(EngineError::NotStarted)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_with_no_running_workflows() {
+    let mut engine = test_engine();
+    engine.start().await.unwrap();
+
+    engine.stop().await;
+
+    assert!(
+        !engine.running.load(Ordering::Acquire),
+        "engine should be stopped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_preserves_completed_metadata() {
+    async fn fast(ctx: Context) -> Result<(), EngineError> {
+        let _: i32 = ctx.step("x").run(async || Ok(42)).await?;
+        Ok(())
+    }
+
+    let mut engine = test_engine();
+    engine.register("fast", fast);
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke("fast").await.unwrap();
+    let instance_id = inv.instance_id().to_string();
+
+    engine.stop().await;
+
+    let meta = engine
+        .get_metadata("fast", &instance_id)
+        .unwrap()
+        .expect("instance exists");
+    assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_timeout_builder_config() {
+    let engine = Engine::builder()
+        .in_memory()
+        .shutdown_timeout(Duration::from_secs(42))
+        .build();
+
+    assert_eq!(engine.shutdown_timeout, Duration::from_secs(42));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_mixed_fast_and_stuck_workflows() {
+    let completed = Arc::new(AtomicU32::new(0));
+    let c = Arc::clone(&completed);
+
+    let mut engine = Engine::builder()
+        .in_memory()
+        .shutdown_timeout(Duration::from_millis(200))
+        .build();
+
+    engine.register("fast", move |ctx: Context| {
+        let c = Arc::clone(&c);
+        async move {
+            let _: i32 = ctx
+                .step("x")
+                .run(async move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    Ok(1)
+                })
+                .await?;
+            Ok(())
+        }
+    });
+    engine.register("stuck", |_ctx: Context| async move {
+        tokio::sync::Notify::new().notified().await;
+        Ok(())
+    });
+    engine.start().await.unwrap();
+
+    let fast_inv = engine.invoke("fast").await.unwrap();
+    let fast_id = fast_inv.instance_id().to_string();
+
+    let stuck_inv = engine.invoke("stuck").await.unwrap();
+    let stuck_id = stuck_inv.instance_id().to_string();
+
+    engine.stop().await;
+
+    assert_eq!(completed.load(Ordering::Relaxed), 1);
+
+    let fast_meta = engine
+        .get_metadata("fast", &fast_id)
+        .unwrap()
+        .expect("instance exists");
+    assert!(matches!(fast_meta.status(), MetadataStatus::Completed(_)));
+
+    let stuck_meta = engine
+        .get_metadata("stuck", &stuck_id)
+        .unwrap()
+        .expect("instance exists");
+    assert_eq!(*stuck_meta.status(), MetadataStatus::Running);
+}

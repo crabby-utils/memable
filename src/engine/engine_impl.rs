@@ -71,6 +71,7 @@ pub struct Engine {
     pub(super) timer_serial: Arc<AtomicU64>,
     pub(super) default_retry: Option<RetryPolicy>,
     pub(super) resume_on_start: bool,
+    pub(super) shutdown_timeout: Duration,
     pub(super) senders: Senders,
 }
 
@@ -90,6 +91,7 @@ impl Engine {
             store: NoStore,
             default_retry: None,
             resume_on_start: true,
+            shutdown_timeout: None,
         }
     }
 
@@ -641,13 +643,66 @@ impl Engine {
         metadata::list_metadata(&self.db, workflow_name)
     }
 
-    /// Stops the engine, preventing new workflow invocations.
+    /// Gracefully stops the engine.
     ///
-    /// Running workflows continue to completion. To wait for all running
-    /// workflows to finish, use [`wait_all`](Engine::wait_all) instead.
-    #[expect(clippy::unused_async)]
+    /// Prevents new workflow invocations, then waits up to the configured
+    /// [`shutdown_timeout`](crate::EngineBuilder::shutdown_timeout) for
+    /// running workflows to complete. If the timeout expires, remaining
+    /// tasks are aborted — their metadata stays as `Running` so they
+    /// resume automatically on the next [`Engine::start`].
+    ///
+    /// The timeout defaults to 30 seconds and can be overridden via
+    /// [`EngineBuilder::shutdown_timeout`](crate::EngineBuilder::shutdown_timeout)
+    /// or the `MEMABLE_SHUTDOWN_TIMEOUT_SECS` environment variable.
+    ///
+    /// To wait indefinitely for all workflows to finish, use
+    /// [`wait_all`](Engine::wait_all) instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut engine = Engine::builder().in_memory().build();
+    /// engine.register("wf", wf);
+    /// engine.start().await?;
+    ///
+    /// let _ = engine.invoke("wf").await?;
+    /// engine.stop().await;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn stop(&self) {
         self.running.store(false, Ordering::Release);
+        info!(
+            timeout_secs = self.shutdown_timeout.as_secs_f64(),
+            "engine stopping — waiting for running workflows"
+        );
+
+        let mut tasks = self.tasks.lock().await;
+        let drain_result = tokio::time::timeout(self.shutdown_timeout, async {
+            while let Some(result) = tasks.join_next().await {
+                if let Err(e) = result {
+                    if e.is_panic() {
+                        error!("workflow task panicked during shutdown: {e}");
+                    }
+                }
+            }
+        })
+        .await;
+
+        if drain_result.is_err() {
+            let remaining = tasks.len();
+            warn!(
+                remaining,
+                "shutdown timeout exceeded — aborting remaining workflows"
+            );
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+        }
+
         info!("engine stopped");
     }
 

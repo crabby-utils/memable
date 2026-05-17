@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use redb::Database;
 use redb::backends::InMemoryBackend;
@@ -9,6 +10,21 @@ use tokio::task::JoinSet;
 
 use crate::error::EngineError;
 use crate::retry::RetryPolicy;
+
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT_ENV: &str = "MEMABLE_SHUTDOWN_TIMEOUT_SECS";
+
+fn resolve_shutdown_timeout(explicit: Option<Duration>) -> Duration {
+    if let Some(d) = explicit {
+        return d;
+    }
+    if let Ok(val) = std::env::var(SHUTDOWN_TIMEOUT_ENV) {
+        if let Ok(secs) = val.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
+    DEFAULT_SHUTDOWN_TIMEOUT
+}
 
 /// Builder for configuring and constructing an [`Engine`](super::Engine).
 ///
@@ -27,6 +43,7 @@ pub struct EngineBuilder<S = NoStore> {
     pub(super) store: S,
     pub(super) default_retry: Option<RetryPolicy>,
     pub(super) resume_on_start: bool,
+    pub(super) shutdown_timeout: Option<Duration>,
 }
 
 /// Typestate: no storage backend configured yet.
@@ -61,6 +78,7 @@ impl EngineBuilder<NoStore> {
             store: HasStore(db),
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
+            shutdown_timeout: self.shutdown_timeout,
         }
     }
 
@@ -89,6 +107,7 @@ impl EngineBuilder<NoStore> {
             store: HasStore(db),
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
+            shutdown_timeout: self.shutdown_timeout,
         })
     }
 
@@ -136,6 +155,33 @@ impl EngineBuilder<NoStore> {
     #[must_use]
     pub fn resume_on_start(mut self, enabled: bool) -> Self {
         self.resume_on_start = enabled;
+        self
+    }
+
+    /// Sets the graceful shutdown timeout for [`Engine::stop`](super::Engine::stop).
+    ///
+    /// When `stop()` is called, the engine waits up to this duration for
+    /// running workflows to complete before aborting them. Aborted
+    /// workflows keep their `Running` metadata and resume on next start.
+    ///
+    /// Defaults to 30 seconds. Can also be set via the
+    /// `MEMABLE_SHUTDOWN_TIMEOUT_SECS` environment variable (builder
+    /// takes precedence).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .shutdown_timeout(Duration::from_secs(10))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = Some(timeout);
         self
     }
 }
@@ -188,6 +234,33 @@ impl EngineBuilder<HasStore> {
         self
     }
 
+    /// Sets the graceful shutdown timeout for [`Engine::stop`](super::Engine::stop).
+    ///
+    /// When `stop()` is called, the engine waits up to this duration for
+    /// running workflows to complete before aborting them. Aborted
+    /// workflows keep their `Running` metadata and resume on next start.
+    ///
+    /// Defaults to 30 seconds. Can also be set via the
+    /// `MEMABLE_SHUTDOWN_TIMEOUT_SECS` environment variable (builder
+    /// takes precedence).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .shutdown_timeout(Duration::from_secs(10))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = Some(timeout);
+        self
+    }
+
     /// Builds the engine.
     ///
     /// This method is only available after a storage backend has been
@@ -203,6 +276,7 @@ impl EngineBuilder<HasStore> {
             timer_serial: Arc::new(AtomicU64::new(0)),
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
+            shutdown_timeout: resolve_shutdown_timeout(self.shutdown_timeout),
             senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
