@@ -17,6 +17,7 @@ use super::execution::{
     claim_suspended_step, poll_timers, spawn_workflow_task, validate_key_component,
 };
 use super::invocation::{Invocation, InvocationBuilder};
+use super::retention::cleanup_expired;
 use super::{Senders, WorkflowFn, WorkflowState};
 use crate::context::{Context, STEPS, StepData, SuspendPoint, serialize_step};
 use crate::error::{EngineError, StateError, SubscribeError};
@@ -72,6 +73,8 @@ pub struct Engine {
     pub(super) default_retry: Option<RetryPolicy>,
     pub(super) resume_on_start: bool,
     pub(super) shutdown_timeout: Duration,
+    pub(super) retention: Option<Duration>,
+    pub(super) workflow_retentions: HashMap<String, Duration>,
     pub(super) senders: Senders,
 }
 
@@ -92,6 +95,7 @@ impl Engine {
             default_retry: None,
             resume_on_start: true,
             shutdown_timeout: None,
+            retention: None,
         }
     }
 
@@ -117,7 +121,7 @@ impl Engine {
     /// let mut engine = Engine::builder().in_memory().build();
     /// engine.register("my-workflow", my_workflow);
     /// ```
-    pub fn register<F, Fut>(&mut self, name: impl Into<String>, workflow: F)
+    pub fn register<F, Fut>(&mut self, name: impl Into<String>, workflow: F) -> Registration<'_>
     where
         F: Fn(Context) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), EngineError>> + Send + 'static,
@@ -131,9 +135,10 @@ impl Engine {
             !name.contains('/'),
             "workflow name must not contain '/': '{name}'"
         );
-        info!(name, "registered workflow");
+        info!(%name, "registered workflow");
         self.workflows
-            .insert(name, Arc::new(move |ctx| Box::pin(workflow(ctx))));
+            .insert(name.clone(), Arc::new(move |ctx| Box::pin(workflow(ctx))));
+        Registration { engine: self, name }
     }
 
     /// Starts the engine, allowing workflow invocations.
@@ -192,6 +197,33 @@ impl Engine {
             }
             .instrument(info_span!("timer_poller")),
         );
+
+        if let Some(retention) = self.retention {
+            let db = Arc::clone(&self.db);
+            let running = Arc::clone(&self.running);
+            let workflow_retentions = self.workflow_retentions.clone();
+            tasks.spawn(
+                async move {
+                    info!(?retention, "retention cleanup started");
+                    while running.load(Ordering::Acquire) {
+                        for _ in 0..60 {
+                            if !running.load(Ordering::Acquire) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        if !running.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Err(e) = cleanup_expired(&db, retention, &workflow_retentions) {
+                            error!(error = %e, "retention cleanup failed");
+                        }
+                    }
+                    info!("retention cleanup stopped");
+                }
+                .instrument(info_span!("retention_cleanup")),
+            );
+        }
 
         drop(tasks);
 
@@ -706,8 +738,8 @@ impl Engine {
         info!("engine stopped");
     }
 
-    /// Waits for all running workflows to complete and prevents new
-    /// invocations.
+    /// Waits indefinitely for all running workflows to complete and
+    /// prevents new invocations.
     ///
     /// Sets the engine to a stopped state, then drains all spawned
     /// workflow tasks. Any call to [`invoke`](Engine::invoke) or
@@ -715,6 +747,9 @@ impl Engine {
     /// [`EngineError::NotStarted`].
     ///
     /// Returns immediately if no workflows are running.
+    ///
+    /// For a timeout-based shutdown that aborts remaining workflows,
+    /// use [`stop`](Engine::stop) instead.
     ///
     /// # Examples
     ///
@@ -823,5 +858,61 @@ impl Engine {
         let (tx, _) = watch::channel(WorkflowState::Started);
         senders.insert(instance_id.to_string(), tx.clone());
         tx
+    }
+}
+
+/// Handle returned by [`Engine::register`] for per-workflow configuration.
+///
+/// The registration is complete even if no methods are called — this type
+/// exists solely to allow optional chaining of per-workflow settings.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use memable::{Engine, Context, EngineError};
+///
+/// async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+///
+/// let mut engine = Engine::builder()
+///     .retention(Duration::from_secs(86400))
+///     .in_memory()
+///     .build();
+///
+/// // Override retention for this specific workflow:
+/// engine.register("ephemeral", wf).retention(Duration::from_secs(3600));
+/// ```
+pub struct Registration<'a> {
+    engine: &'a mut Engine,
+    name: String,
+}
+
+impl Registration<'_> {
+    /// Sets a per-workflow retention override.
+    ///
+    /// This duration takes precedence over the engine-level default for
+    /// instances of this workflow definition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::{Engine, Context, EngineError};
+    ///
+    /// async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    ///
+    /// let mut engine = Engine::builder()
+    ///     .retention(Duration::from_secs(30 * 24 * 60 * 60))
+    ///     .in_memory()
+    ///     .build();
+    ///
+    /// engine.register("short-lived", wf).retention(Duration::from_secs(3600));
+    /// ```
+    #[expect(clippy::must_use_candidate, clippy::return_self_not_must_use)]
+    pub fn retention(self, ttl: Duration) -> Self {
+        self.engine
+            .workflow_retentions
+            .insert(self.name.clone(), ttl);
+        self
     }
 }

@@ -2,6 +2,7 @@ mod builder;
 mod engine_impl;
 mod execution;
 mod invocation;
+mod retention;
 mod state;
 
 #[cfg(test)]
@@ -25,6 +26,6 @@ pub(crate) type WorkflowFn = Arc<
 pub(crate) type Senders = Arc<Mutex<HashMap<String, watch::Sender<state::WorkflowState>>>>;
 
 pub use self::builder::{EngineBuilder, HasStore, NoStore};
-pub use self::engine_impl::Engine;
+pub use self::engine_impl::{Engine, Registration};
 pub use self::invocation::{Invocation, InvocationBuilder};
 pub use self::state::WorkflowState;

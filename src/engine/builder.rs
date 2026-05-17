@@ -44,6 +44,7 @@ pub struct EngineBuilder<S = NoStore> {
     pub(super) default_retry: Option<RetryPolicy>,
     pub(super) resume_on_start: bool,
     pub(super) shutdown_timeout: Option<Duration>,
+    pub(super) retention: Option<Duration>,
 }
 
 /// Typestate: no storage backend configured yet.
@@ -79,6 +80,7 @@ impl EngineBuilder<NoStore> {
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
             shutdown_timeout: self.shutdown_timeout,
+            retention: self.retention,
         }
     }
 
@@ -108,6 +110,7 @@ impl EngineBuilder<NoStore> {
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
             shutdown_timeout: self.shutdown_timeout,
+            retention: self.retention,
         })
     }
 
@@ -182,6 +185,33 @@ impl EngineBuilder<NoStore> {
     #[must_use]
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = Some(timeout);
+        self
+    }
+
+    /// Enables retention cleanup with the given time-to-live.
+    ///
+    /// When configured, the engine spawns a background task that
+    /// periodically removes terminal (completed or failed) workflow
+    /// instances older than this duration. All associated step entries,
+    /// timer entries, and the metadata entry are deleted.
+    ///
+    /// Retention is disabled by default. Per-workflow overrides can be
+    /// set via [`Registration::retention`](super::Registration::retention).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .retention(Duration::from_secs(30 * 24 * 60 * 60))
+    ///     .in_memory()
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn retention(mut self, ttl: Duration) -> Self {
+        self.retention = Some(ttl);
         self
     }
 }
@@ -261,6 +291,33 @@ impl EngineBuilder<HasStore> {
         self
     }
 
+    /// Enables retention cleanup with the given time-to-live.
+    ///
+    /// When configured, the engine spawns a background task that
+    /// periodically removes terminal (completed or failed) workflow
+    /// instances older than this duration. All associated step entries,
+    /// timer entries, and the metadata entry are deleted.
+    ///
+    /// Retention is disabled by default. Per-workflow overrides can be
+    /// set via [`Registration::retention`](super::Registration::retention).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use memable::Engine;
+    ///
+    /// let engine = Engine::builder()
+    ///     .in_memory()
+    ///     .retention(Duration::from_secs(30 * 24 * 60 * 60))
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn retention(mut self, ttl: Duration) -> Self {
+        self.retention = Some(ttl);
+        self
+    }
+
     /// Builds the engine.
     ///
     /// This method is only available after a storage backend has been
@@ -277,6 +334,8 @@ impl EngineBuilder<HasStore> {
             default_retry: self.default_retry,
             resume_on_start: self.resume_on_start,
             shutdown_timeout: resolve_shutdown_timeout(self.shutdown_timeout),
+            retention: self.retention,
+            workflow_retentions: HashMap::new(),
             senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }

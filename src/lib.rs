@@ -98,7 +98,8 @@ mod stream;
 
 pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint};
 pub use engine::{
-    Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, WorkflowState,
+    Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, Registration,
+    WorkflowState,
 };
 pub use error::{EngineError, StateError, StepError, SubscribeError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};
