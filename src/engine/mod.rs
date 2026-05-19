@@ -4,6 +4,7 @@ mod execution;
 mod invocation;
 mod retention;
 mod state;
+mod workflow;
 
 #[cfg(test)]
 mod tests;
@@ -27,5 +28,6 @@ pub(crate) type Senders = Arc<Mutex<HashMap<String, watch::Sender<state::Workflo
 
 pub use self::builder::{EngineBuilder, HasStore, NoStore};
 pub use self::engine_impl::{Engine, Registration};
-pub use self::invocation::{Invocation, InvocationBuilder};
+pub use self::invocation::{Completed, Invocation, InvocationBuilder, WaitResult};
 pub use self::state::WorkflowState;
+pub use self::workflow::IntoWorkflow;

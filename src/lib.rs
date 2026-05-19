@@ -11,7 +11,9 @@
 //! ## Quick start
 //!
 //! ```
-//! use memable::{Engine, Context, EngineError, WorkflowState};
+//! use memable::{Engine, Context, EngineError, WorkflowDef};
+//!
+//! const GREET: WorkflowDef = WorkflowDef::new("greet");
 //!
 //! async fn greet(ctx: Context) -> Result<(), EngineError> {
 //!     let name: String = ctx.step("fetch-name:v1").run(async || {
@@ -27,11 +29,10 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let mut engine = Engine::builder().in_memory().build();
-//! engine.register("greet", greet);
+//! engine.register(&GREET, greet);
 //! engine.start().await?;
 //!
-//! let state = engine.invoke("greet").await?.wait().await;
-//! assert_eq!(state, WorkflowState::Completed(None));
+//! engine.invoke(&GREET).await?.wait().await.unwrap_completed();
 //! # Ok(())
 //! # }
 //! ```
@@ -43,7 +44,9 @@
 //!
 //! ```
 //! use std::time::Duration;
-//! use memable::{Engine, Context, EngineError, StepError, RetryPolicy, WorkflowState};
+//! use memable::{Engine, Context, EngineError, StepError, RetryPolicy, WorkflowDef};
+//!
+//! const FETCH: WorkflowDef = WorkflowDef::new("fetch");
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +55,7 @@
 //!     .default_retry(RetryPolicy::exponential(3, Duration::from_secs(1)))
 //!     .build();
 //!
-//! engine.register("fetch", |ctx: Context| async move {
+//! engine.register(&FETCH, |ctx: Context| async move {
 //!     let data: String = ctx.step("call-api:v1")
 //!         .run(async || {
 //!             // Returning Retryable triggers automatic retry with backoff.
@@ -63,8 +66,7 @@
 //! });
 //! engine.start().await?;
 //!
-//! let state = engine.invoke("fetch").await?.wait().await;
-//! assert_eq!(state, WorkflowState::Completed(None));
+//! engine.invoke(&FETCH).await?.wait().await.unwrap_completed();
 //! # Ok(())
 //! # }
 //! ```
@@ -96,10 +98,10 @@ mod metadata;
 mod retry;
 mod stream;
 
-pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint};
+pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint, WorkflowDef};
 pub use engine::{
-    Engine, EngineBuilder, HasStore, Invocation, InvocationBuilder, NoStore, Registration,
-    WorkflowState,
+    Completed, Engine, EngineBuilder, HasStore, IntoWorkflow, Invocation, InvocationBuilder,
+    NoStore, Registration, WaitResult, WorkflowState,
 };
 pub use error::{EngineError, StateError, StepError, SubscribeError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};

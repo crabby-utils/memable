@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::StepError;
-use crate::context::{STEPS, SuspendPoint};
+use crate::context::{STEPS, SuspendPoint, WorkflowDef};
 use crate::error::{StateError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 
@@ -12,12 +12,16 @@ use redb::ReadableDatabase as _;
 
 use super::retention::cleanup_expired;
 
+const WF: WorkflowDef = WorkflowDef::new("wf");
+
 fn test_engine() -> Engine {
     Engine::builder().in_memory().build()
 }
 
 #[tokio::test]
 async fn simple_workflow_completes() {
+    const ADD: WorkflowDef = WorkflowDef::new("add");
+
     async fn add(ctx: Context) -> Result<(), EngineError> {
         let a: i32 = ctx.step("a").run(async || Ok(1)).await?;
         let b: i32 = ctx.step("b").run(async || Ok(2)).await?;
@@ -26,22 +30,24 @@ async fn simple_workflow_completes() {
     }
 
     let mut engine = test_engine();
-    engine.register("add", add);
+    engine.register(&ADD, add);
     engine.start().await.unwrap();
 
-    let state = engine.invoke("add").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&ADD).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
 async fn memoisation_on_resume() {
+    const MEMO: WorkflowDef = WorkflowDef::new("memo");
+
     let counter = Arc::new(AtomicU32::new(0));
     let attempts = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("memo", move |ctx: Context| {
+    engine.register(&MEMO, move |ctx: Context| {
         let c = Arc::clone(&c);
         let a = Arc::clone(&a);
         async move {
@@ -69,26 +75,28 @@ async fn memoisation_on_resume() {
     engine.start().await.unwrap();
 
     // First invoke — s1 succeeds, s2 fails.
-    let inv = engine.invoke("memo").await.unwrap();
+    let inv = engine.invoke(&MEMO).await.unwrap();
     let instance_id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
     assert_eq!(counter.load(Ordering::Relaxed), 2);
 
     // Resume — s1 is memoised, s2 retries and succeeds.
     counter.store(0, Ordering::Relaxed);
     let state = engine
-        .resume("memo", &instance_id)
+        .resume(&MEMO, &instance_id)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
 async fn step_error_produces_failed_state() {
+    const FAIL: WorkflowDef = WorkflowDef::new("fail");
+
     async fn failing(ctx: Context) -> Result<(), EngineError> {
         let _: String = ctx
             .step("fail")
@@ -98,11 +106,11 @@ async fn step_error_produces_failed_state() {
     }
 
     let mut engine = test_engine();
-    engine.register("fail", failing);
+    engine.register(&FAIL, failing);
     engine.start().await.unwrap();
 
-    let state = engine.invoke("fail").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    let state = engine.invoke(&FAIL).await.unwrap().wait().await;
+    assert!(state.is_failed());
 }
 
 #[tokio::test]
@@ -111,7 +119,7 @@ async fn different_instances_have_separate_caches() {
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -126,31 +134,35 @@ async fn different_instances_have_separate_caches() {
     });
     engine.start().await.unwrap();
 
-    engine.invoke("wf").await.unwrap().wait().await;
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
 
     assert_eq!(counter.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
 async fn invoke_before_start_fails() {
+    const NOOP: WorkflowDef = WorkflowDef::new("noop");
+
     async fn noop(_ctx: Context) -> Result<(), EngineError> {
         Ok(())
     }
 
     let mut engine = test_engine();
-    engine.register("noop", noop);
+    engine.register(&NOOP, noop);
 
-    let result = engine.invoke("noop").await;
+    let result = engine.invoke(&NOOP).await;
     assert!(matches!(result, Err(EngineError::NotStarted)));
 }
 
 #[tokio::test]
 async fn invoke_unknown_workflow_fails() {
+    const NONEXISTENT: WorkflowDef = WorkflowDef::new("nonexistent");
+
     let mut engine = test_engine();
     engine.start().await.unwrap();
 
-    let result = engine.invoke("nonexistent").await;
+    let result = engine.invoke(&NONEXISTENT).await;
     assert!(matches!(result, Err(EngineError::WorkflowNotFound(_))));
 }
 
@@ -160,7 +172,7 @@ async fn wait_all_waits_for_completion() {
 
     let c = Arc::clone(&counter);
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -175,9 +187,9 @@ async fn wait_all_waits_for_completion() {
     });
     engine.start().await.unwrap();
 
-    drop(engine.invoke("wf").await.unwrap());
-    drop(engine.invoke("wf").await.unwrap());
-    drop(engine.invoke("wf").await.unwrap());
+    drop(engine.invoke(&WF).await.unwrap());
+    drop(engine.invoke(&WF).await.unwrap());
+    drop(engine.invoke(&WF).await.unwrap());
 
     engine.wait_all().await;
     assert_eq!(counter.load(Ordering::Relaxed), 3);
@@ -185,17 +197,19 @@ async fn wait_all_waits_for_completion() {
 
 #[tokio::test]
 async fn invoke_after_wait_all_fails() {
+    const NOOP: WorkflowDef = WorkflowDef::new("noop");
+
     async fn noop(_ctx: Context) -> Result<(), EngineError> {
         Ok(())
     }
 
     let mut engine = test_engine();
-    engine.register("noop", noop);
+    engine.register(&NOOP, noop);
     engine.start().await.unwrap();
 
     engine.wait_all().await;
 
-    let result = engine.invoke("noop").await;
+    let result = engine.invoke(&NOOP).await;
     assert!(matches!(result, Err(EngineError::NotStarted)));
 }
 
@@ -209,13 +223,15 @@ async fn wait_all_with_no_active_tasks() {
 
 #[tokio::test]
 async fn status_persisted_and_restored_on_resume() {
+    const STATUS_WF: WorkflowDef = WorkflowDef::new("status-wf");
+
     let step_counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&step_counter);
     let attempts = Arc::new(AtomicU32::new(0));
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("status-wf", move |ctx: Context| {
+    engine.register(&STATUS_WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         let a = Arc::clone(&a);
         async move {
@@ -247,32 +263,34 @@ async fn status_persisted_and_restored_on_resume() {
     engine.start().await.unwrap();
 
     // First run — s1 succeeds, s2 fails.
-    let inv = engine.invoke("status-wf").await.unwrap();
+    let inv = engine.invoke(&STATUS_WF).await.unwrap();
     let instance_id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
     assert_eq!(step_counter.load(Ordering::Relaxed), 2);
 
     // Resume — s1 is memoised, s2 retries and succeeds.
     step_counter.store(0, Ordering::Relaxed);
     let state = engine
-        .resume("status-wf", &instance_id)
+        .resume(&STATUS_WF, &instance_id)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(Some("step-two".into())));
+    assert_eq!(state.unwrap_completed().status(), Some("step-two"));
     // Only s2 re-executed; s1 was served from cache (with its persisted status).
     assert_eq!(step_counter.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
 async fn subscribers_not_notified_during_replay() {
+    const SILENT_REPLAY: WorkflowDef = WorkflowDef::new("silent-replay");
+
     let attempts = Arc::new(AtomicU32::new(0));
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("silent-replay", move |ctx: Context| {
+    engine.register(&SILENT_REPLAY, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             ctx.set_status("phase-1");
@@ -294,12 +312,12 @@ async fn subscribers_not_notified_during_replay() {
     engine.start().await.unwrap();
 
     // First invoke — s1 ok, s2 fails.
-    let inv = engine.invoke("silent-replay").await.unwrap();
+    let inv = engine.invoke(&SILENT_REPLAY).await.unwrap();
     let instance_id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Resume and watch for notifications.
-    let mut inv = engine.resume("silent-replay", &instance_id).await.unwrap();
+    let mut inv = engine.resume(&SILENT_REPLAY, &instance_id).await.unwrap();
     let rx = inv.status();
 
     // Mark the current value as seen so changed() only fires on new updates.
@@ -337,20 +355,22 @@ async fn metadata_completed_on_success() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert_eq!(*meta.status(), MetadataStatus::Completed(None));
     assert!(meta.completed_at().is_some());
 }
 
 #[tokio::test]
 async fn metadata_failed_on_error() {
+    const FAIL: WorkflowDef = WorkflowDef::new("fail");
+
     async fn failing(ctx: Context) -> Result<(), EngineError> {
         let _: String = ctx
             .step("fail")
@@ -360,25 +380,27 @@ async fn metadata_failed_on_error() {
     }
 
     let mut engine = test_engine();
-    engine.register("fail", failing);
+    engine.register(&FAIL, failing);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("fail").await.unwrap();
+    let inv = engine.invoke(&FAIL).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let meta = engine.get_metadata("fail", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&FAIL, &id).unwrap().unwrap();
     assert!(matches!(meta.status(), MetadataStatus::Failed(msg) if msg.contains("boom")),);
     assert!(meta.completed_at().is_some());
 }
 
 #[tokio::test]
 async fn metadata_updated_after_resume() {
+    const RETRY_WF: WorkflowDef = WorkflowDef::new("retry-wf");
+
     let attempts = Arc::new(AtomicU32::new(0));
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("retry-wf", move |ctx: Context| {
+    engine.register(&RETRY_WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -395,16 +417,16 @@ async fn metadata_updated_after_resume() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("retry-wf").await.unwrap();
+    let inv = engine.invoke(&RETRY_WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let meta = engine.get_metadata("retry-wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&RETRY_WF, &id).unwrap().unwrap();
     assert!(matches!(meta.status(), MetadataStatus::Failed(_)));
 
-    engine.resume("retry-wf", &id).await.unwrap().wait().await;
+    engine.resume(&RETRY_WF, &id).await.unwrap().wait().await;
 
-    let meta = engine.get_metadata("retry-wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&RETRY_WF, &id).unwrap().unwrap();
     assert_eq!(*meta.status(), MetadataStatus::Completed(None));
 }
 
@@ -416,40 +438,44 @@ async fn list_instances_returns_all() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    engine.invoke("wf").await.unwrap().wait().await;
-    engine.invoke("wf").await.unwrap().wait().await;
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
 
-    let instances = engine.list_instances("wf").unwrap();
+    let instances = engine.list_instances(&WF).unwrap();
     assert_eq!(instances.len(), 3);
 }
 
 #[tokio::test]
 async fn list_instances_filters_by_workflow_name() {
+    const ALPHA: WorkflowDef = WorkflowDef::new("alpha");
+    const BETA: WorkflowDef = WorkflowDef::new("beta");
+    const NONEXISTENT: WorkflowDef = WorkflowDef::new("nonexistent");
+
     async fn wf(ctx: Context) -> Result<(), EngineError> {
         let _: i32 = ctx.step("s1").run(async || Ok(1)).await?;
         Ok(())
     }
 
     let mut engine = test_engine();
-    engine.register("alpha", wf);
-    engine.register("beta", wf);
+    engine.register(&ALPHA, wf);
+    engine.register(&BETA, wf);
     engine.start().await.unwrap();
 
-    engine.invoke("alpha").await.unwrap().wait().await;
-    engine.invoke("alpha").await.unwrap().wait().await;
-    engine.invoke("beta").await.unwrap().wait().await;
+    engine.invoke(&ALPHA).await.unwrap().wait().await;
+    engine.invoke(&ALPHA).await.unwrap().wait().await;
+    engine.invoke(&BETA).await.unwrap().wait().await;
 
-    let alpha_instances = engine.list_instances("alpha").unwrap();
+    let alpha_instances = engine.list_instances(&ALPHA).unwrap();
     assert_eq!(alpha_instances.len(), 2);
 
-    let beta_instances = engine.list_instances("beta").unwrap();
+    let beta_instances = engine.list_instances(&BETA).unwrap();
     assert_eq!(beta_instances.len(), 1);
 
-    let none_instances = engine.list_instances("nonexistent").unwrap();
+    let none_instances = engine.list_instances(&NONEXISTENT).unwrap();
     assert!(none_instances.is_empty());
 }
 
@@ -458,7 +484,7 @@ async fn get_metadata_returns_none_for_unknown() {
     let mut engine = test_engine();
     engine.start().await.unwrap();
 
-    let meta = engine.get_metadata("wf", "no-such-id").unwrap();
+    let meta = engine.get_metadata(&WF, "no-such-id").unwrap();
     assert!(meta.is_none());
 }
 
@@ -470,14 +496,14 @@ async fn metadata_consistent_after_wait_multi_thread() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert_eq!(*meta.status(), MetadataStatus::Completed(None));
 }
 
@@ -489,24 +515,25 @@ async fn metadata_correct_after_wait_all() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let id1 = engine.invoke("wf").await.unwrap().instance_id().to_string();
-    let id2 = engine.invoke("wf").await.unwrap().instance_id().to_string();
+    let id1 = engine.invoke(&WF).await.unwrap().instance_id().to_string();
+    let id2 = engine.invoke(&WF).await.unwrap().instance_id().to_string();
 
     engine.wait_all().await;
 
-    let m1 = engine.get_metadata("wf", &id1).unwrap().unwrap();
-    let m2 = engine.get_metadata("wf", &id2).unwrap().unwrap();
+    let m1 = engine.get_metadata(&WF, &id1).unwrap().unwrap();
+    let m2 = engine.get_metadata(&WF, &id2).unwrap().unwrap();
     assert_eq!(*m1.status(), MetadataStatus::Completed(None));
     assert_eq!(*m2.status(), MetadataStatus::Completed(None));
 }
 
 #[tokio::test]
 async fn list_instances_on_fresh_engine() {
+    const ANYTHING: WorkflowDef = WorkflowDef::new("anything");
     let engine = test_engine();
-    let instances = engine.list_instances("anything").unwrap();
+    let instances = engine.list_instances(&ANYTHING).unwrap();
     assert!(instances.is_empty());
 }
 
@@ -522,34 +549,31 @@ async fn suspend_then_signal_completes() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "wait:v1".into(),
-            status: "wait:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "wait:v1" && status == "wait:v1"
+    ));
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert!(
         matches!(meta.status(), MetadataStatus::Suspended { status, .. } if status == "wait:v1"),
     );
 
     let state = engine
-        .signal("wf", &id, &WAIT, "hello".to_string())
+        .signal(&WF, &id, &WAIT, "hello".to_string())
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert_eq!(*meta.status(), MetadataStatus::Completed(None));
 }
 
@@ -566,33 +590,31 @@ async fn suspend_with_custom_status() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "approval:v1".into(),
-            status: "Waiting for manager approval".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status }
+            if key == "approval:v1" && status == "Waiting for manager approval"
+    ));
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert!(matches!(
         meta.status(),
         MetadataStatus::Suspended { status, .. } if status == "Waiting for manager approval"
     ));
 
     let state = engine
-        .signal("wf", &id, &APPROVAL, true)
+        .signal(&WF, &id, &APPROVAL, true)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
@@ -603,7 +625,7 @@ async fn memoised_steps_preserved_across_suspend() {
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let c2 = Arc::clone(&c);
@@ -627,19 +649,19 @@ async fn memoised_steps_preserved_across_suspend() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
     counter.store(0, Ordering::Relaxed);
     let state = engine
-        .signal("wf", &id, &GATE, "go".to_string())
+        .signal(&WF, &id, &GATE, "go".to_string())
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
     // s1 memoised (0 executions), s2 runs (1 execution)
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 }
@@ -654,29 +676,23 @@ async fn resume_without_signal_stays_suspended() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "wait:v1".into(),
-            status: "wait:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "wait:v1" && status == "wait:v1"
+    ));
 
     // Resume without signal — should still be suspended.
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "wait:v1".into(),
-            status: "wait:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "wait:v1" && status == "wait:v1"
+    ));
 }
 
 #[tokio::test]
@@ -699,26 +715,23 @@ async fn step_rejects_suspended_entry() {
     };
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
     // V1: workflow suspends at "action:v1".
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "action:v1".into(),
-            status: "action:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "action:v1" && status == "action:v1"
+    ));
 
     // V2: same key is now a regular step.
     use_step.store(true, Ordering::Release);
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
     assert!(
-        matches!(state, WorkflowState::Failed(ref msg) if msg.contains("suspended entry")),
+        matches!(state, WaitResult::Failed(ref msg) if msg.contains("suspended entry")),
         "expected SuspendedStepConflict, got: {state:?}"
     );
 }
@@ -736,43 +749,37 @@ async fn multiple_suspend_points() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "first:v1".into(),
-            status: "first:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "first:v1" && status == "first:v1"
+    ));
 
     // Signal first suspend point.
     let state = engine
-        .signal("wf", &id, &FIRST, 1i32)
+        .signal(&WF, &id, &FIRST, 1i32)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "second:v1".into(),
-            status: "second:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "second:v1" && status == "second:v1"
+    ));
 
     // Signal second suspend point.
     let state = engine
-        .signal("wf", &id, &SECOND, 2i32)
+        .signal(&WF, &id, &SECOND, 2i32)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
@@ -783,7 +790,7 @@ async fn suspend_after_failed_step_on_resume() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -802,38 +809,37 @@ async fn suspend_after_failed_step_on_resume() {
     engine.start().await.unwrap();
 
     // First invoke — s1 fails.
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
 
     // Resume — s1 succeeds, hits suspend.
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    assert!(matches!(
         state,
-        WorkflowState::Suspended {
-            key: "gate:v1".into(),
-            status: "gate:v1".into()
-        }
-    );
+        WaitResult::Suspended { ref key, ref status } if key == "gate:v1" && status == "gate:v1"
+    ));
 
     // Signal — completes.
     let state = engine
-        .signal("wf", &id, &GATE, "done".to_string())
+        .signal(&WF, &id, &GATE, "done".to_string())
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
 async fn step_without_status_stores_none() {
+    const NO_STATUS: WorkflowDef = WorkflowDef::new("no-status");
+
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("no-status", move |ctx: Context| {
+    engine.register(&NO_STATUS, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             // No set_status call — status should be None in the record.
@@ -849,29 +855,31 @@ async fn step_without_status_stores_none() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("no-status").await.unwrap();
+    let inv = engine.invoke(&NO_STATUS).await.unwrap();
     let instance_id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Resume — s1 is memoised, execution counter stays at 1.
     counter.store(0, Ordering::Relaxed);
     let state = engine
-        .resume("no-status", &instance_id)
+        .resume(&NO_STATUS, &instance_id)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timer_fires_and_completes_workflow() {
+    const TIMER_WF: WorkflowDef = WorkflowDef::new("timer-wf");
+
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("timer-wf", move |ctx: Context| {
+    engine.register(&TIMER_WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let c2 = Arc::clone(&c);
@@ -895,17 +903,17 @@ async fn timer_fires_and_completes_workflow() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("timer-wf").await.unwrap();
+    let inv = engine.invoke(&TIMER_WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Suspended { .. }));
+    assert!(state.is_suspended());
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
     // Wait for the poller to fire the timer.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let meta = engine.get_metadata("timer-wf", &id).unwrap().unwrap();
+        let meta = engine.get_metadata(&TIMER_WF, &id).unwrap().unwrap();
         if meta.status().is_terminal() {
             assert_eq!(*meta.status(), MetadataStatus::Completed(None));
             break;
@@ -921,11 +929,13 @@ async fn timer_fires_and_completes_workflow() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timer_memoised_on_resume() {
+    const TIMER_MEMO: WorkflowDef = WorkflowDef::new("timer-memo");
+
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("timer-memo", move |ctx: Context| {
+    engine.register(&TIMER_MEMO, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -941,7 +951,7 @@ async fn timer_memoised_on_resume() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("timer-memo").await.unwrap();
+    let inv = engine.invoke(&TIMER_MEMO).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
     assert_eq!(counter.load(Ordering::Relaxed), 1);
@@ -950,7 +960,7 @@ async fn timer_memoised_on_resume() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let meta = engine.get_metadata("timer-memo", &id).unwrap().unwrap();
+        let meta = engine.get_metadata(&TIMER_MEMO, &id).unwrap().unwrap();
         if meta.status().is_terminal() {
             break;
         }
@@ -959,18 +969,20 @@ async fn timer_memoised_on_resume() {
 
     // Resume — both s1 and timer are memoised.
     counter.store(0, Ordering::Relaxed);
-    let state = engine.resume("timer-memo", &id).await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.resume(&TIMER_MEMO, &id).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timer_skipped_when_workflow_not_suspended() {
+    const TIMER_FAIL: WorkflowDef = WorkflowDef::new("timer-fail");
+
     let attempts = Arc::new(AtomicU32::new(0));
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("timer-fail", move |ctx: Context| {
+    engine.register(&TIMER_FAIL, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -989,20 +1001,20 @@ async fn timer_skipped_when_workflow_not_suspended() {
     engine.start().await.unwrap();
 
     // First invoke — s1 fails before reaching timer.
-    let inv = engine.invoke("timer-fail").await.unwrap();
+    let inv = engine.invoke(&TIMER_FAIL).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
 
     // Resume — s1 succeeds, hits timer.
-    let state = engine.resume("timer-fail", &id).await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Suspended { .. }));
+    let state = engine.resume(&TIMER_FAIL, &id).await.unwrap().wait().await;
+    assert!(state.is_suspended());
 
     // Wait for timer to fire and complete.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let meta = engine.get_metadata("timer-fail", &id).unwrap().unwrap();
+        let meta = engine.get_metadata(&TIMER_FAIL, &id).unwrap().unwrap();
         if meta.status().is_terminal() {
             assert_eq!(*meta.status(), MetadataStatus::Completed(None));
             break;
@@ -1013,11 +1025,13 @@ async fn timer_skipped_when_workflow_not_suspended() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn timer_with_steps_before_and_after() {
+    const MULTI_TIMER: WorkflowDef = WorkflowDef::new("multi-timer");
+
     let counter = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("multi-timer", move |ctx: Context| {
+    engine.register(&MULTI_TIMER, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let c2 = Arc::clone(&c);
@@ -1050,7 +1064,7 @@ async fn timer_with_steps_before_and_after() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("multi-timer").await.unwrap();
+    let inv = engine.invoke(&MULTI_TIMER).await.unwrap();
     let id = inv.instance_id().to_string();
     // First timer suspends.
     inv.wait().await;
@@ -1060,7 +1074,7 @@ async fn timer_with_steps_before_and_after() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let meta = engine.get_metadata("multi-timer", &id).unwrap().unwrap();
+        let meta = engine.get_metadata(&MULTI_TIMER, &id).unwrap().unwrap();
         if meta.status().is_terminal() {
             assert_eq!(*meta.status(), MetadataStatus::Completed(None));
             break;
@@ -1086,11 +1100,11 @@ async fn step_with_timeout_completes() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1108,11 +1122,11 @@ async fn step_timeout_exceeds_deadline() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("timed out")));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    assert!(matches!(state, WaitResult::Failed(ref msg) if msg.contains("timed out")));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1121,7 +1135,7 @@ async fn timed_out_step_not_persisted() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1140,15 +1154,15 @@ async fn timed_out_step_not_persisted() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 
     // Resume — step re-executes (not cached) and succeeds this time.
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
 }
 
@@ -1158,7 +1172,7 @@ async fn timeout_skipped_on_cache_hit() {
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -1174,15 +1188,15 @@ async fn timeout_skipped_on_cache_hit() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
     assert_eq!(counter.load(Ordering::Relaxed), 1);
 
     // Resume with impossibly short timeout — cache hit returns instantly.
     counter.store(0, Ordering::Relaxed);
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
@@ -1202,11 +1216,11 @@ async fn timeout_with_borrowing_closure() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 // --- Key validation (S1) tests ---
@@ -1214,50 +1228,7 @@ async fn timeout_with_borrowing_closure() {
 #[test]
 #[should_panic(expected = "workflow name must not contain '/'")]
 fn register_rejects_slash_in_name() {
-    let mut engine = test_engine();
-    engine.register("bad/name", |_ctx: Context| async { Ok(()) });
-}
-
-#[tokio::test]
-async fn invoke_rejects_slash_in_name() {
-    async fn wf(_ctx: Context) -> Result<(), EngineError> {
-        Ok(())
-    }
-    let mut engine = test_engine();
-    engine.register("wf", wf);
-    engine.start().await.unwrap();
-
-    let Err(err) = engine.invoke("bad/name").await else {
-        panic!("expected InvalidKey error");
-    };
-    assert!(matches!(
-        err,
-        EngineError::InvalidKey {
-            label: "workflow_name",
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn resume_rejects_slash_in_workflow_name() {
-    async fn wf(_ctx: Context) -> Result<(), EngineError> {
-        Ok(())
-    }
-    let mut engine = test_engine();
-    engine.register("wf", wf);
-    engine.start().await.unwrap();
-
-    let Err(err) = engine.resume("bad/name", "id-1").await else {
-        panic!("expected InvalidKey error");
-    };
-    assert!(matches!(
-        err,
-        EngineError::InvalidKey {
-            label: "workflow_name",
-            ..
-        }
-    ));
+    let _ = WorkflowDef::<(), ()>::new("bad/name");
 }
 
 #[tokio::test]
@@ -1266,10 +1237,10 @@ async fn resume_rejects_slash_in_instance_id() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let Err(err) = engine.resume("wf", "bad/id").await else {
+    let Err(err) = engine.resume(&WF, "bad/id").await else {
         panic!("expected InvalidKey error");
     };
     assert!(matches!(
@@ -1282,7 +1253,7 @@ async fn resume_rejects_slash_in_instance_id() {
 }
 
 #[tokio::test]
-async fn signal_rejects_slash_in_name_or_id() {
+async fn signal_rejects_slash_in_instance_id() {
     const WAIT: SuspendPoint<bool> = SuspendPoint::new("wait:v1");
 
     async fn wf(ctx: Context) -> Result<(), EngineError> {
@@ -1290,25 +1261,14 @@ async fn signal_rejects_slash_in_name_or_id() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
-    let id = inv.instance_id().to_string();
+    let inv = engine.invoke(&WF).await.unwrap();
+    let _id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let Err(err) = engine.signal("bad/name", &id, &WAIT, true).await else {
-        panic!("expected InvalidKey error");
-    };
-    assert!(matches!(
-        err,
-        EngineError::InvalidKey {
-            label: "workflow_name",
-            ..
-        }
-    ));
-
-    let Err(err) = engine.signal("wf", "bad/id", &WAIT, true).await else {
+    let Err(err) = engine.signal(&WF, "bad/id", &WAIT, true).await else {
         panic!("expected InvalidKey error");
     };
     assert!(matches!(
@@ -1354,14 +1314,14 @@ fn suspend_rejects_slash_in_key() {
 #[tokio::test]
 async fn timer_rejects_slash_in_key() {
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
+    engine.register(&WF, |ctx: Context| async move {
         ctx.timer("bad/key", Duration::from_secs(1))?;
         Ok(())
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    assert!(state.is_failed());
 }
 
 #[test]
@@ -1398,14 +1358,14 @@ fn suspend_rejects_reserved_prefix() {
 #[tokio::test]
 async fn timer_rejects_reserved_prefix() {
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
+    engine.register(&WF, |ctx: Context| async move {
         ctx.timer("_reserved", Duration::from_secs(1))?;
         Ok(())
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    assert!(state.is_failed());
 }
 
 #[tokio::test]
@@ -1418,14 +1378,14 @@ async fn signal_rejects_when_step_does_not_exist() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let Err(err) = engine.signal("wf", &id, &WRONG, true).await else {
+    let Err(err) = engine.signal(&WF, &id, &WRONG, true).await else {
         panic!("expected SignalRejected error");
     };
     assert!(
@@ -1445,19 +1405,19 @@ async fn signal_rejects_already_completed_step() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // First signal succeeds — step is Suspended.
-    let inv = engine.signal("wf", &id, &GATE, true).await.unwrap();
+    let inv = engine.signal(&WF, &id, &GATE, true).await.unwrap();
     inv.wait().await;
 
     // Second signal to same step fails — it was already claimed.
-    let Err(err) = engine.signal("wf", &id, &GATE, true).await else {
+    let Err(err) = engine.signal(&WF, &id, &GATE, true).await else {
         panic!("expected SignalSuperseded error");
     };
     assert!(
@@ -1477,18 +1437,15 @@ async fn signal_rejects_pre_completing_future_step() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Attempt to signal a step the workflow hasn't reached yet.
-    let Err(err) = engine
-        .signal("wf", &id, &SECOND, "sneaky".to_string())
-        .await
-    else {
+    let Err(err) = engine.signal(&WF, &id, &SECOND, "sneaky".to_string()).await else {
         panic!("expected SignalRejected error");
     };
     assert!(
@@ -1507,21 +1464,21 @@ async fn signal_type_mismatch_returns_error() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Signal with String instead of the expected i32 (simulates cross-version mismatch).
     let inv = engine
-        .signal("wf", &id, &GATE_STRING, "wrong type".to_string())
+        .signal(&WF, &id, &GATE_STRING, "wrong type".to_string())
         .await
         .unwrap();
     let state = inv.wait().await;
     assert!(
-        matches!(state, WorkflowState::Failed(ref msg) if msg.contains("type mismatch")),
+        matches!(state, WaitResult::Failed(ref msg) if msg.contains("type mismatch")),
         "expected TypeMismatch failure, got {state:?}"
     );
 }
@@ -1536,18 +1493,18 @@ async fn signal_type_mismatch_caught_for_binary_compatible_types() {
         Ok(())
     }
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Signal with u32 instead of i32 — same binary layout, different type name.
-    let inv = engine.signal("wf", &id, &GATE_U32, 42_u32).await.unwrap();
+    let inv = engine.signal(&WF, &id, &GATE_U32, 42_u32).await.unwrap();
     let state = inv.wait().await;
     assert!(
-        matches!(state, WorkflowState::Failed(ref msg) if msg.contains("type mismatch")),
+        matches!(state, WaitResult::Failed(ref msg) if msg.contains("type mismatch")),
         "expected TypeMismatch failure for u32 vs i32, got {state:?}"
     );
 }
@@ -1622,16 +1579,16 @@ async fn double_signal_same_step_second_superseded() {
 
     COUNTER.store(0, Ordering::Relaxed);
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     let (r1, r2) = tokio::join!(
-        engine.signal("wf", &id, &GATE, true),
-        engine.signal("wf", &id, &GATE, true),
+        engine.signal(&WF, &id, &GATE, true),
+        engine.signal(&WF, &id, &GATE, true),
     );
 
     let mut successes = 0u32;
@@ -1671,15 +1628,15 @@ async fn timer_after_signal_already_claimed() {
 
     COUNTER.store(0, Ordering::Relaxed);
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Manually signal the timer step before the timer fires.
-    let inv = engine.signal("wf", &id, &WAIT, ()).await.unwrap();
+    let inv = engine.signal(&WF, &id, &WAIT, ()).await.unwrap();
     inv.wait().await;
 
     engine.wait_all().await;
@@ -1689,7 +1646,7 @@ async fn timer_after_signal_already_claimed() {
         "workflow should run exactly once"
     );
 
-    let meta = engine.get_metadata("wf", &id).unwrap().unwrap();
+    let meta = engine.get_metadata(&WF, &id).unwrap().unwrap();
     assert_eq!(*meta.status(), MetadataStatus::Completed(None));
 }
 
@@ -1705,10 +1662,10 @@ async fn signal_timer_tracked_by_wait_all() {
 
     COUNTER.store(0, Ordering::Relaxed);
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let _id = inv.instance_id().to_string();
     inv.wait().await;
 
@@ -1732,7 +1689,7 @@ async fn retryable_error_retries_then_exhausts() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1748,8 +1705,8 @@ async fn retryable_error_retries_then_exhausts() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("3 attempts")));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    assert!(matches!(state, WaitResult::Failed(ref msg) if msg.contains("3 attempts")));
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
 }
 
@@ -1759,7 +1716,7 @@ async fn permanent_error_skips_retry() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1775,8 +1732,8 @@ async fn permanent_error_skips_retry() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("fatal")));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    assert!(matches!(state, WaitResult::Failed(ref msg) if msg.contains("fatal")));
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 }
 
@@ -1786,7 +1743,7 @@ async fn step_succeeds_on_second_attempt() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let v: i32 = ctx
@@ -1805,8 +1762,8 @@ async fn step_succeeds_on_second_attempt() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
 }
 
@@ -1816,7 +1773,7 @@ async fn exponential_backoff_delays() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1833,7 +1790,7 @@ async fn exponential_backoff_delays() {
     engine.start().await.unwrap();
 
     let start = tokio::time::Instant::now();
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
     let elapsed = start.elapsed();
 
     assert_eq!(attempts.load(Ordering::Relaxed), 4);
@@ -1850,7 +1807,7 @@ async fn engine_default_retry_applies() {
         .in_memory()
         .default_retry(crate::RetryPolicy::fixed(2, Duration::from_millis(10)))
         .build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1865,7 +1822,7 @@ async fn engine_default_retry_applies() {
     });
     engine.start().await.unwrap();
 
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
     assert_eq!(attempts.load(Ordering::Relaxed), 3);
 }
 
@@ -1878,7 +1835,7 @@ async fn per_step_retry_overrides_default() {
         .in_memory()
         .default_retry(crate::RetryPolicy::fixed(5, Duration::from_millis(10)))
         .build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1894,7 +1851,7 @@ async fn per_step_retry_overrides_default() {
     });
     engine.start().await.unwrap();
 
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
     // Per-step policy: 1 retry = 2 total attempts (not 6 from the default).
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
 }
@@ -1908,7 +1865,7 @@ async fn no_retry_overrides_default() {
         .in_memory()
         .default_retry(crate::RetryPolicy::fixed(3, Duration::from_millis(10)))
         .build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1924,7 +1881,7 @@ async fn no_retry_overrides_default() {
     });
     engine.start().await.unwrap();
 
-    engine.invoke("wf").await.unwrap().wait().await;
+    engine.invoke(&WF).await.unwrap().wait().await;
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 }
 
@@ -1934,7 +1891,7 @@ async fn dead_letter_persisted_and_resume_re_executes() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1953,21 +1910,21 @@ async fn dead_letter_persisted_and_resume_re_executes() {
     });
     engine.start().await.unwrap();
 
-    // First invoke: 2 attempts (1 + 1 retry), both fail → RetriesExhausted.
-    let inv = engine.invoke("wf").await.unwrap();
+    // First invoke: 2 attempts (1 + 1 retry), both fail -> RetriesExhausted.
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
     assert_eq!(attempts.load(Ordering::Relaxed), 2);
 
     // Resume: fresh retry budget, 2 more attempts, both fail again.
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    assert!(state.is_failed());
     assert_eq!(attempts.load(Ordering::Relaxed), 4);
 
     // Resume again: first attempt succeeds (n=4 >= 4).
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.resume(&WF, &id).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test(start_paused = true)]
@@ -1976,7 +1933,7 @@ async fn timeout_applies_per_attempt() {
     let a = Arc::clone(&attempts);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -1996,10 +1953,10 @@ async fn timeout_applies_per_attempt() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
     // First attempt times out (StepTimeout propagates immediately,
     // bypassing retry). Timeout is not retried.
-    assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("timed out")));
+    assert!(matches!(state, WaitResult::Failed(ref msg) if msg.contains("timed out")));
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 }
 
@@ -2012,7 +1969,7 @@ async fn memoised_step_skips_retry() {
         .in_memory()
         .default_retry(crate::RetryPolicy::fixed(3, Duration::from_millis(1)))
         .build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let a = Arc::clone(&a);
         async move {
             let _: i32 = ctx
@@ -2027,19 +1984,19 @@ async fn memoised_step_skips_retry() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Resume — s1 is memoised, closure should NOT run again.
-    engine.resume("wf", &id).await.unwrap().wait().await;
+    engine.resume(&WF, &id).await.unwrap().wait().await;
     assert_eq!(attempts.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn retryable_without_policy_behaves_like_step_failed() {
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
+    engine.register(&WF, |ctx: Context| async move {
         let _: i32 = ctx
             .step("s1")
             .run(async || Err(StepError::retryable("boom")))
@@ -2048,10 +2005,10 @@ async fn retryable_without_policy_behaves_like_step_failed() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    // No retry policy → StepFailed (not RetriesExhausted).
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    // No retry policy -> StepFailed (not RetriesExhausted).
     assert!(
-        matches!(state, WorkflowState::Failed(msg) if msg.contains("boom") && !msg.contains("attempts"))
+        matches!(state, WaitResult::Failed(ref msg) if msg.contains("boom") && !msg.contains("attempts"))
     );
 }
 
@@ -2059,28 +2016,29 @@ async fn retryable_without_policy_behaves_like_step_failed() {
 
 #[tokio::test]
 async fn invoke_with_input_delivers_payload() {
+    const INPUT_WF: WorkflowDef<i32> = WorkflowDef::new("wf");
+
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
-        let val: i32 = ctx.input::<i32>()?.unwrap();
+    engine.register(&INPUT_WF, |_ctx: Context, val: i32| async move {
         assert_eq!(val, 42);
         Ok(())
     });
     engine.start().await.unwrap();
 
     let state = engine
-        .invoke("wf")
+        .invoke(&INPUT_WF)
         .input(42_i32)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
 async fn invoke_without_input_backward_compatible() {
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
+    engine.register(&WF, |ctx: Context| async move {
         let _: String = ctx
             .step("s:v1")
             .run(async || Ok("hello".to_string()))
@@ -2089,53 +2047,59 @@ async fn invoke_without_input_backward_compatible() {
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
 async fn input_returns_none_when_not_provided() {
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
+    engine.register(&WF, |ctx: Context| async move {
         let val = ctx.input::<String>()?;
         assert!(val.is_none());
         Ok(())
     });
     engine.start().await.unwrap();
 
-    let state = engine.invoke("wf").await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.invoke(&WF).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
 async fn input_type_mismatch() {
+    // Register a workflow expecting String input, but internally try to
+    // deserialize the _input step as i32 to trigger a type mismatch.
+    const INPUT_WF: WorkflowDef<String> = WorkflowDef::new("wf");
+
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
-        let _val = ctx.input::<i32>()?;
+    engine.register(&INPUT_WF, |ctx: Context, _val: String| async move {
+        // Manually read the raw _input as the wrong type.
+        let _wrong = ctx.input::<i32>()?;
         Ok(())
     });
     engine.start().await.unwrap();
 
     let state = engine
-        .invoke("wf")
+        .invoke(&INPUT_WF)
         .input("not an i32".to_string())
         .await
         .unwrap()
         .wait()
         .await;
-    assert!(matches!(state, WorkflowState::Failed(msg) if msg.contains("type mismatch")));
+    assert!(matches!(state, WaitResult::Failed(ref msg) if msg.contains("type mismatch")));
 }
 
 #[tokio::test]
 async fn input_preserved_across_resume() {
+    const INPUT_WF: WorkflowDef<String> = WorkflowDef::new("wf");
+
     let call_count = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&call_count);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&INPUT_WF, move |ctx: Context, name: String| {
         let c = Arc::clone(&c);
         async move {
-            let name: String = ctx.input::<String>()?.unwrap();
             let attempt = c.fetch_add(1, Ordering::Relaxed);
             if attempt == 0 {
                 return Err(EngineError::step_failed(
@@ -2154,26 +2118,26 @@ async fn input_preserved_across_resume() {
     engine.start().await.unwrap();
 
     let inv = engine
-        .invoke("wf")
+        .invoke(&INPUT_WF)
         .input("Alice".to_string())
         .await
         .unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Failed(_)));
+    assert!(state.is_failed());
 
-    let state = engine.resume("wf", &id).await.unwrap().wait().await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state = engine.resume(&INPUT_WF, &id).await.unwrap().wait().await;
+    let _ = state.unwrap_completed();
     assert_eq!(call_count.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
 async fn input_coexists_with_suspend_and_signal() {
+    const INPUT_WF: WorkflowDef<String> = WorkflowDef::new("wf");
     const APPROVE: SuspendPoint<bool> = SuspendPoint::new("approve:v1");
 
     let mut engine = test_engine();
-    engine.register("wf", |ctx: Context| async move {
-        let prefix: String = ctx.input::<String>()?.unwrap();
+    engine.register(&INPUT_WF, |ctx: Context, prefix: String| async move {
         let approval: bool = ctx.suspend(&APPROVE).await?;
         assert!(approval);
         let _: String = ctx
@@ -2185,21 +2149,21 @@ async fn input_coexists_with_suspend_and_signal() {
     engine.start().await.unwrap();
 
     let inv = engine
-        .invoke("wf")
+        .invoke(&INPUT_WF)
         .input("request-1".to_string())
         .await
         .unwrap();
     let id = inv.instance_id().to_string();
     let state = inv.wait().await;
-    assert!(matches!(state, WorkflowState::Suspended { .. }));
+    assert!(state.is_suspended());
 
     let state = engine
-        .signal("wf", &id, &APPROVE, true)
+        .signal(&INPUT_WF, &id, &APPROVE, true)
         .await
         .unwrap()
         .wait()
         .await;
-    assert_eq!(state, WorkflowState::Completed(None));
+    let _ = state.unwrap_completed();
 }
 
 #[tokio::test]
@@ -2212,13 +2176,13 @@ async fn subscribe_live_workflow_yields_states() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
 
-    let mut stream = engine.subscribe("wf", &id).unwrap();
+    let mut stream = engine.subscribe(&WF, &id).unwrap();
     let first = stream.next().await.unwrap();
     assert_eq!(first, WorkflowState::Started);
 
@@ -2238,14 +2202,14 @@ async fn subscribe_after_completion_returns_snapshot() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let mut stream = engine.subscribe("wf", &id).unwrap();
+    let mut stream = engine.subscribe(&WF, &id).unwrap();
     assert_eq!(stream.next().await, Some(WorkflowState::Completed(None)));
     assert_eq!(stream.next().await, None);
 }
@@ -2253,10 +2217,10 @@ async fn subscribe_after_completion_returns_snapshot() {
 #[tokio::test]
 async fn subscribe_unknown_instance_returns_not_found() {
     let mut engine = test_engine();
-    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.register(&WF, |_ctx: Context| async { Ok(()) });
     engine.start().await.unwrap();
 
-    let err = engine.subscribe("wf", "nonexistent").unwrap_err();
+    let err = engine.subscribe(&WF, "nonexistent").unwrap_err();
     assert!(matches!(err, SubscribeError::NotFound { .. }));
 }
 
@@ -2281,10 +2245,10 @@ async fn subscribe_stale_running_returns_error() {
         .unwrap()
         .resume_on_start(false)
         .build();
-    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.register(&WF, |_ctx: Context| async { Ok(()) });
     engine.start().await.unwrap();
 
-    let err = engine.subscribe("wf", "crashed").unwrap_err();
+    let err = engine.subscribe(&WF, "crashed").unwrap_err();
     assert!(matches!(err, SubscribeError::StaleRunning { .. }));
 }
 
@@ -2300,13 +2264,13 @@ async fn subscribe_survives_suspend_and_signal() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
 
-    let mut stream = engine.subscribe("wf", &id).unwrap();
+    let mut stream = engine.subscribe(&WF, &id).unwrap();
 
     // Consume states through suspension
     inv.wait().await;
@@ -2321,7 +2285,7 @@ async fn subscribe_survives_suspend_and_signal() {
 
     // Signal — subscriber should see resumed execution on same stream
     engine
-        .signal("wf", &id, &GATE, true)
+        .signal(&WF, &id, &GATE, true)
         .await
         .unwrap()
         .wait()
@@ -2345,14 +2309,14 @@ async fn subscribe_multiple_concurrent_subscribers() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
 
-    let mut s1 = engine.subscribe("wf", &id).unwrap();
-    let mut s2 = engine.subscribe("wf", &id).unwrap();
+    let mut s1 = engine.subscribe(&WF, &id).unwrap();
+    let mut s2 = engine.subscribe(&WF, &id).unwrap();
 
     inv.wait().await;
 
@@ -2380,16 +2344,16 @@ async fn subscribe_suspended_returns_live_stream() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Subscribing to a suspended workflow returns a live stream
     // (sender stays in map). First item is the current Suspended state.
-    let mut stream = engine.subscribe("wf", &id).unwrap();
+    let mut stream = engine.subscribe(&WF, &id).unwrap();
     let state = stream.next().await.unwrap();
     assert!(matches!(state, WorkflowState::Suspended { .. }));
 }
@@ -2401,17 +2365,17 @@ async fn subscribe_fallback_completed_metadata() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // After completion the sender is removed from the map.
     // subscribe() falls through to redb metadata and returns a snapshot.
     tokio::task::yield_now().await;
-    let mut stream = engine.subscribe("wf", &id).unwrap();
+    let mut stream = engine.subscribe(&WF, &id).unwrap();
     assert_eq!(stream.next().await, Some(WorkflowState::Completed(None)));
     assert_eq!(stream.next().await, None);
 }
@@ -2437,7 +2401,7 @@ async fn auto_resume_running_instances_on_start() {
     let exec_count = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&exec_count);
     let mut engine = Engine::builder().open(&path).unwrap().build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -2482,7 +2446,7 @@ async fn resume_on_start_false_skips_recovery() {
         .unwrap()
         .resume_on_start(false)
         .build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -2526,7 +2490,7 @@ async fn auto_resume_skips_suspended_instances() {
     let exec_count = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&exec_count);
     let mut engine = Engine::builder().open(&path).unwrap().build();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -2555,14 +2519,14 @@ async fn state_returns_completed_for_finished_workflow() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let state = engine.state("wf", &id).unwrap();
+    let state = engine.state(&WF, &id).unwrap();
     assert_eq!(state, WorkflowState::Completed(None));
 }
 
@@ -2576,14 +2540,14 @@ async fn state_returns_suspended_for_waiting_workflow() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let state = engine.state("wf", &id).unwrap();
+    let state = engine.state(&WF, &id).unwrap();
     assert!(
         matches!(state, WorkflowState::Suspended { ref key, .. } if key == "gate:v1"),
         "expected Suspended, got {state:?}"
@@ -2597,14 +2561,14 @@ async fn state_returns_failed_for_failed_workflow() {
     }
 
     let mut engine = test_engine();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let state = engine.state("wf", &id).unwrap();
+    let state = engine.state(&WF, &id).unwrap();
     assert!(
         matches!(state, WorkflowState::Failed(_)),
         "expected Failed, got {state:?}"
@@ -2614,10 +2578,10 @@ async fn state_returns_failed_for_failed_workflow() {
 #[tokio::test]
 async fn state_returns_not_found_for_missing_instance() {
     let mut engine = test_engine();
-    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.register(&WF, |_ctx: Context| async { Ok(()) });
     engine.start().await.unwrap();
 
-    let err = engine.state("wf", "no-such-id").unwrap_err();
+    let err = engine.state(&WF, "no-such-id").unwrap_err();
     assert!(
         matches!(err, StateError::NotFound { .. }),
         "expected NotFound, got {err:?}"
@@ -2627,7 +2591,7 @@ async fn state_returns_not_found_for_missing_instance() {
 #[tokio::test]
 async fn state_returns_started_for_stale_running() {
     let mut engine = test_engine();
-    engine.register("wf", |_ctx: Context| async { Ok(()) });
+    engine.register(&WF, |_ctx: Context| async { Ok(()) });
     engine.start().await.unwrap();
 
     metadata::write_metadata(
@@ -2638,7 +2602,7 @@ async fn state_returns_started_for_stale_running() {
     )
     .unwrap();
 
-    let state = engine.state("wf", "stale-1").unwrap();
+    let state = engine.state(&WF, "stale-1").unwrap();
     assert_eq!(state, WorkflowState::Started);
 }
 
@@ -2649,7 +2613,7 @@ async fn state_reads_live_sender_while_running() {
 
     let b = Arc::clone(&barrier);
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let b = Arc::clone(&b);
         async move {
             ctx.set_status("working");
@@ -2659,13 +2623,13 @@ async fn state_reads_live_sender_while_running() {
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
 
     tokio::task::yield_now().await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let state = engine.state("wf", &id).unwrap();
+    let state = engine.state(&WF, &id).unwrap();
     assert_eq!(state, WorkflowState::InProgress("working".into()));
 
     barrier.wait().await;
@@ -2680,7 +2644,7 @@ async fn stop_waits_for_running_workflows() {
     let c = Arc::clone(&counter);
 
     let mut engine = test_engine();
-    engine.register("wf", move |ctx: Context| {
+    engine.register(&WF, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -2695,8 +2659,8 @@ async fn stop_waits_for_running_workflows() {
     });
     engine.start().await.unwrap();
 
-    let _ = engine.invoke("wf").await.unwrap();
-    let _ = engine.invoke("wf").await.unwrap();
+    let _ = engine.invoke(&WF).await.unwrap();
+    let _ = engine.invoke(&WF).await.unwrap();
 
     engine.stop().await;
 
@@ -2705,24 +2669,26 @@ async fn stop_waits_for_running_workflows() {
 
 #[tokio::test(start_paused = true)]
 async fn stop_aborts_after_timeout() {
+    const STUCK: WorkflowDef = WorkflowDef::new("stuck");
+
     let mut engine = Engine::builder()
         .in_memory()
         .shutdown_timeout(Duration::from_millis(100))
         .build();
 
-    engine.register("stuck", |_ctx: Context| async move {
+    engine.register(&STUCK, |_ctx: Context| async move {
         tokio::sync::Notify::new().notified().await;
         Ok(())
     });
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("stuck").await.unwrap();
+    let inv = engine.invoke(&STUCK).await.unwrap();
     let instance_id = inv.instance_id().to_string();
 
     engine.stop().await;
 
     let meta = engine
-        .get_metadata("stuck", &instance_id)
+        .get_metadata(&STUCK, &instance_id)
         .unwrap()
         .expect("instance exists");
     assert_eq!(*meta.status(), MetadataStatus::Running);
@@ -2730,17 +2696,19 @@ async fn stop_aborts_after_timeout() {
 
 #[tokio::test(start_paused = true)]
 async fn invoke_after_stop_fails() {
+    const NOOP: WorkflowDef = WorkflowDef::new("noop");
+
     async fn noop(_ctx: Context) -> Result<(), EngineError> {
         Ok(())
     }
 
     let mut engine = test_engine();
-    engine.register("noop", noop);
+    engine.register(&NOOP, noop);
     engine.start().await.unwrap();
 
     engine.stop().await;
 
-    let result = engine.invoke("noop").await;
+    let result = engine.invoke(&NOOP).await;
     assert!(matches!(result, Err(EngineError::NotStarted)));
 }
 
@@ -2759,22 +2727,24 @@ async fn stop_with_no_running_workflows() {
 
 #[tokio::test(start_paused = true)]
 async fn stop_preserves_completed_metadata() {
+    const FAST: WorkflowDef = WorkflowDef::new("fast");
+
     async fn fast(ctx: Context) -> Result<(), EngineError> {
         let _: i32 = ctx.step("x").run(async || Ok(42)).await?;
         Ok(())
     }
 
     let mut engine = test_engine();
-    engine.register("fast", fast);
+    engine.register(&FAST, fast);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("fast").await.unwrap();
+    let inv = engine.invoke(&FAST).await.unwrap();
     let instance_id = inv.instance_id().to_string();
 
     engine.stop().await;
 
     let meta = engine
-        .get_metadata("fast", &instance_id)
+        .get_metadata(&FAST, &instance_id)
         .unwrap()
         .expect("instance exists");
     assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
@@ -2792,6 +2762,9 @@ async fn shutdown_timeout_builder_config() {
 
 #[tokio::test(start_paused = true)]
 async fn stop_mixed_fast_and_stuck_workflows() {
+    const FAST: WorkflowDef = WorkflowDef::new("fast");
+    const STUCK: WorkflowDef = WorkflowDef::new("stuck");
+
     let completed = Arc::new(AtomicU32::new(0));
     let c = Arc::clone(&completed);
 
@@ -2800,7 +2773,7 @@ async fn stop_mixed_fast_and_stuck_workflows() {
         .shutdown_timeout(Duration::from_millis(200))
         .build();
 
-    engine.register("fast", move |ctx: Context| {
+    engine.register(&FAST, move |ctx: Context| {
         let c = Arc::clone(&c);
         async move {
             let _: i32 = ctx
@@ -2813,16 +2786,16 @@ async fn stop_mixed_fast_and_stuck_workflows() {
             Ok(())
         }
     });
-    engine.register("stuck", |_ctx: Context| async move {
+    engine.register(&STUCK, |_ctx: Context| async move {
         tokio::sync::Notify::new().notified().await;
         Ok(())
     });
     engine.start().await.unwrap();
 
-    let fast_inv = engine.invoke("fast").await.unwrap();
+    let fast_inv = engine.invoke(&FAST).await.unwrap();
     let fast_id = fast_inv.instance_id().to_string();
 
-    let stuck_inv = engine.invoke("stuck").await.unwrap();
+    let stuck_inv = engine.invoke(&STUCK).await.unwrap();
     let stuck_id = stuck_inv.instance_id().to_string();
 
     engine.stop().await;
@@ -2830,13 +2803,13 @@ async fn stop_mixed_fast_and_stuck_workflows() {
     assert_eq!(completed.load(Ordering::Relaxed), 1);
 
     let fast_meta = engine
-        .get_metadata("fast", &fast_id)
+        .get_metadata(&FAST, &fast_id)
         .unwrap()
         .expect("instance exists");
     assert!(matches!(fast_meta.status(), MetadataStatus::Completed(_)));
 
     let stuck_meta = engine
-        .get_metadata("stuck", &stuck_id)
+        .get_metadata(&STUCK, &stuck_id)
         .unwrap()
         .expect("instance exists");
     assert_eq!(*stuck_meta.status(), MetadataStatus::Running);
@@ -2855,15 +2828,15 @@ async fn retention_cleans_expired_completed_workflows() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     // Workflow exists before cleanup.
-    assert!(engine.get_metadata("wf", &id).unwrap().is_some());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 
     // Verify steps exist.
     let read_txn = engine.db.begin_read().unwrap();
@@ -2881,7 +2854,7 @@ async fn retention_cleans_expired_completed_workflows() {
     assert_eq!(cleaned, 1);
 
     // Metadata gone.
-    assert!(engine.get_metadata("wf", &id).unwrap().is_none());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_none());
 
     // Steps gone.
     let read_txn = engine.db.begin_read().unwrap();
@@ -2899,10 +2872,10 @@ async fn retention_cleans_expired_failed_workflows() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", failing);
+    engine.register(&WF, failing);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
@@ -2910,7 +2883,7 @@ async fn retention_cleans_expired_failed_workflows() {
 
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 1);
-    assert!(engine.get_metadata("wf", &id).unwrap().is_none());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2924,10 +2897,10 @@ async fn retention_does_not_touch_running_workflows() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", slow);
+    engine.register(&WF, slow);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
 
     // Give the task time to start.
@@ -2936,7 +2909,7 @@ async fn retention_does_not_touch_running_workflows() {
     // Cleanup should find nothing to clean.
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
-    assert!(engine.get_metadata("wf", &id).unwrap().is_some());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 
     drop(inv);
     engine.stop().await;
@@ -2955,10 +2928,10 @@ async fn retention_does_not_touch_suspended_workflows() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", suspending);
+    engine.register(&WF, suspending);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
@@ -2966,11 +2939,14 @@ async fn retention_does_not_touch_suspended_workflows() {
 
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
-    assert!(engine.get_metadata("wf", &id).unwrap().is_some());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 }
 
 #[tokio::test]
 async fn retention_per_workflow_override() {
+    const LONG_LIVED: WorkflowDef = WorkflowDef::new("long-lived");
+    const SHORT_LIVED: WorkflowDef = WorkflowDef::new("short-lived");
+
     async fn wf(ctx: Context) -> Result<(), EngineError> {
         let _: i32 = ctx.step("s1").run(async || Ok(1)).await?;
         Ok(())
@@ -2980,17 +2956,17 @@ async fn retention_per_workflow_override() {
         .retention(Duration::from_secs(10))
         .in_memory()
         .build();
-    engine.register("long-lived", wf);
+    engine.register(&LONG_LIVED, wf);
     engine
-        .register("short-lived", wf)
+        .register(&SHORT_LIVED, wf)
         .retention(Duration::from_secs(1));
     engine.start().await.unwrap();
 
-    let long_inv = engine.invoke("long-lived").await.unwrap();
+    let long_inv = engine.invoke(&LONG_LIVED).await.unwrap();
     let long_id = long_inv.instance_id().to_string();
     long_inv.wait().await;
 
-    let short_inv = engine.invoke("short-lived").await.unwrap();
+    let short_inv = engine.invoke(&SHORT_LIVED).await.unwrap();
     let short_id = short_inv.instance_id().to_string();
     short_inv.wait().await;
 
@@ -3005,13 +2981,13 @@ async fn retention_per_workflow_override() {
     // short-lived is gone, long-lived remains.
     assert!(
         engine
-            .get_metadata("short-lived", &short_id)
+            .get_metadata(&SHORT_LIVED, &short_id)
             .unwrap()
             .is_none()
     );
     assert!(
         engine
-            .get_metadata("long-lived", &long_id)
+            .get_metadata(&LONG_LIVED, &long_id)
             .unwrap()
             .is_some()
     );
@@ -3028,16 +3004,16 @@ async fn retention_no_op_when_nothing_expired() {
         .retention(Duration::from_secs(100))
         .in_memory()
         .build();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(100), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
-    assert!(engine.get_metadata("wf", &id).unwrap().is_some());
+    assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -3051,14 +3027,14 @@ async fn retention_cleans_multiple_instances() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
-    let inv1 = engine.invoke("wf").await.unwrap();
+    let inv1 = engine.invoke(&WF).await.unwrap();
     inv1.wait().await;
-    let inv2 = engine.invoke("wf").await.unwrap();
+    let inv2 = engine.invoke(&WF).await.unwrap();
     inv2.wait().await;
-    let inv3 = engine.invoke("wf").await.unwrap();
+    let inv3 = engine.invoke(&WF).await.unwrap();
     inv3.wait().await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -3066,7 +3042,7 @@ async fn retention_cleans_multiple_instances() {
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 3);
 
-    let instances = engine.list_instances("wf").unwrap();
+    let instances = engine.list_instances(&WF).unwrap();
     assert!(instances.is_empty());
 }
 
@@ -3081,18 +3057,18 @@ async fn retention_concurrent_invoke_and_cleanup() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", wf);
+    engine.register(&WF, wf);
     engine.start().await.unwrap();
 
     // Create and complete an instance.
-    let old_inv = engine.invoke("wf").await.unwrap();
+    let old_inv = engine.invoke(&WF).await.unwrap();
     let old_id = old_inv.instance_id().to_string();
     old_inv.wait().await;
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Invoke a new instance concurrently with cleanup.
-    let new_inv = engine.invoke("wf").await.unwrap();
+    let new_inv = engine.invoke(&WF).await.unwrap();
     let new_id = new_inv.instance_id().to_string();
 
     let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
@@ -3101,8 +3077,8 @@ async fn retention_concurrent_invoke_and_cleanup() {
     new_inv.wait().await;
 
     // Old is gone, new survived.
-    assert!(engine.get_metadata("wf", &old_id).unwrap().is_none());
-    assert!(engine.get_metadata("wf", &new_id).unwrap().is_some());
+    assert!(engine.get_metadata(&WF, &old_id).unwrap().is_none());
+    assert!(engine.get_metadata(&WF, &new_id).unwrap().is_some());
 }
 
 #[tokio::test]
@@ -3118,14 +3094,14 @@ async fn retention_cleanup_removes_all_step_entries() {
         .retention(Duration::from_secs(1))
         .in_memory()
         .build();
-    engine.register("wf", multi_step);
+    engine.register(&WF, multi_step);
     engine.start().await.unwrap();
 
-    let inv = engine.invoke("wf").await.unwrap();
+    let inv = engine.invoke(&WF).await.unwrap();
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    // Verify all 3 steps exist.
+    // Verify all step entries exist (3 steps + 1 _output).
     let read_txn = engine.db.begin_read().unwrap();
     let steps_table = read_txn.open_table(STEPS).unwrap();
     let prefix = format!("wf/{id}/");
@@ -3134,7 +3110,7 @@ async fn retention_cleanup_removes_all_step_entries() {
         .range(prefix.as_str()..end.as_str())
         .unwrap()
         .count();
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
     drop(steps_table);
     drop(read_txn);
 

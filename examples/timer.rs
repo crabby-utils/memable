@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
-use memable::{Context, Engine, EngineError, MetadataStatus, WorkflowState};
+use memable::{Context, Engine, EngineError, MetadataStatus, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+const PIPELINE: WorkflowDef = WorkflowDef::new("pipeline");
 
 /// A workflow that performs work, waits for a cooldown period, then
 /// continues with more work. The timer is automatically signalled by
@@ -44,20 +47,23 @@ async fn pipeline_with_cooldown(ctx: Context) -> Result<(), EngineError> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::builder().in_memory().build();
-    engine.register("pipeline", pipeline_with_cooldown);
+
+    // Register using the WorkflowDef constant.
+    engine.register(&PIPELINE, pipeline_with_cooldown);
     engine.start().await?;
 
     // Invoke the workflow. It runs step 1, then suspends at the timer.
     println!("=== Invoking workflow ===");
-    let inv = engine.invoke("pipeline").await?;
+    let inv = engine.invoke(&PIPELINE).await?;
     let instance_id = inv.instance_id().to_string();
-    let state = inv.wait().await;
-    println!("State: {state}");
-    assert!(matches!(state, WorkflowState::Suspended { .. }));
+    let result = inv.wait().await;
+    println!("State: {result}");
+    assert!(result.is_suspended());
 
     // The metadata table shows the workflow is suspended with timer info.
+    // get_metadata takes a name string, so use DEF.name().
     let meta = engine
-        .get_metadata("pipeline", &instance_id)?
+        .get_metadata(&PIPELINE, &instance_id)?
         .expect("instance exists");
     println!("Metadata: {}", meta.status());
     println!();
@@ -69,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let meta = engine
-            .get_metadata("pipeline", &instance_id)?
+            .get_metadata(&PIPELINE, &instance_id)?
             .expect("instance exists");
         if meta.status().is_terminal() {
             println!("State: {}", meta.status());
@@ -83,10 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resuming now would hit all memoised steps (including the timer)
     // and complete instantly without re-executing anything.
+    // resume() takes &WorkflowDef instead of a name string.
     println!("=== Resuming (all steps memoised) ===");
-    let state = engine.resume("pipeline", &instance_id).await?.wait().await;
-    println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state_inv = engine.resume(&PIPELINE, &instance_id).await?;
+    let result = state_inv.wait().await;
+    println!("State: {result}");
+    let _ = result.unwrap_completed();
 
     engine.stop().await;
     Ok(())

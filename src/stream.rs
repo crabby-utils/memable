@@ -18,21 +18,22 @@ use crate::engine::WorkflowState;
 /// # Examples
 ///
 /// ```
-/// # use memable::{Engine, Context, EngineError, WorkflowState, StatusStream};
+/// # use memable::{Engine, Context, EngineError, WorkflowState, StatusStream, WorkflowDef};
 /// use futures_core::Stream;
 ///
+/// # const WF: WorkflowDef = WorkflowDef::new("wf");
 /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut engine = Engine::builder().in_memory().build();
-/// engine.register("wf", wf);
+/// engine.register(&WF, wf);
 /// engine.start().await?;
 ///
-/// let inv = engine.invoke("wf").await?;
+/// let inv = engine.invoke(&WF).await?;
 /// let id = inv.instance_id().to_string();
 ///
 /// // Subscribe returns a Stream<Item = WorkflowState>
-/// let stream: StatusStream = engine.subscribe("wf", &id).unwrap();
+/// let stream: StatusStream = engine.subscribe(&WF, &id).unwrap();
 /// # Ok(())
 /// # }
 /// ```
@@ -96,17 +97,18 @@ impl StatusStream {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowState, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// # let inv = engine.invoke("wf").await?;
+    /// # let mut inv = engine.invoke(&WF).await?;
     /// # let id = inv.instance_id().to_string();
     /// # inv.wait().await;
-    /// let mut stream = engine.subscribe("wf", &id).unwrap();
+    /// let mut stream = engine.subscribe(&WF, &id).unwrap();
     /// let state = stream.next().await;
     /// assert_eq!(state, Some(WorkflowState::Completed(None)));
     /// # Ok(())

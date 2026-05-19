@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::future::Future;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -19,7 +19,7 @@ use super::execution::{
 use super::invocation::{Invocation, InvocationBuilder};
 use super::retention::cleanup_expired;
 use super::{Senders, WorkflowFn, WorkflowState};
-use crate::context::{Context, STEPS, StepData, SuspendPoint, serialize_step};
+use crate::context::{STEPS, StepData, SuspendPoint, WorkflowDef, serialize_step};
 use crate::error::{EngineError, StateError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 use crate::retry::RetryPolicy;
@@ -27,9 +27,10 @@ use crate::stream::StatusStream;
 
 /// The durable execution engine.
 ///
-/// Workflows are registered as named definitions, then invoked by name.
-/// Each invocation auto-generates a unique instance ID and returns an
-/// [`Invocation`] handle for observing the workflow's [`WorkflowState`].
+/// Workflows are registered via [`WorkflowDef`] constants, then invoked
+/// by reference. Each invocation auto-generates a unique instance ID and
+/// returns an [`Invocation`] handle for observing the workflow's
+/// [`WorkflowState`] and reading typed output.
 /// Failed instances can be retried with [`Engine::resume`].
 ///
 /// # Lifecycle
@@ -43,7 +44,9 @@ use crate::stream::StatusStream;
 /// # Examples
 ///
 /// ```
-/// use memable::{Engine, Context, EngineError, WorkflowState};
+/// use memable::{Engine, Context, EngineError, WorkflowDef};
+///
+/// const GREET: WorkflowDef = WorkflowDef::new("greet");
 ///
 /// async fn greet(ctx: Context) -> Result<(), EngineError> {
 ///     let name: String = ctx.step("fetch-name:v1").run(async || {
@@ -56,11 +59,10 @@ use crate::stream::StatusStream;
 /// # #[tokio::main]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut engine = Engine::builder().in_memory().build();
-/// engine.register("greet", greet);
+/// engine.register(&GREET, greet);
 /// engine.start().await?;
 ///
-/// let state = engine.invoke("greet").await?.wait().await;
-/// assert_eq!(state, WorkflowState::Completed(None));
+/// engine.invoke(&GREET).await?.wait().await.unwrap_completed();
 /// # Ok(())
 /// # }
 /// ```
@@ -99,45 +101,47 @@ impl Engine {
         }
     }
 
-    /// Registers a workflow definition by name.
+    /// Registers a workflow definition.
     ///
-    /// The workflow function receives a [`Context`] and returns
-    /// `Result<(), EngineError>`. Durable results are communicated via
-    /// [`Context::step`].
+    /// The workflow function signature is determined by the [`WorkflowDef`]
+    /// type parameters. Functions with no input take `(Context)`, while
+    /// functions with input take `(Context, I)`. Both return
+    /// `Result<O, EngineError>`.
     ///
     /// # Panics
     ///
-    /// Panics if the engine has already been started, or if `name`
-    /// contains the `/` delimiter.
+    /// Panics if the engine has already been started.
     ///
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError};
+    /// use memable::{Engine, Context, EngineError, WorkflowDef};
+    ///
+    /// const MY_WF: WorkflowDef = WorkflowDef::new("my-workflow");
+    ///
     /// async fn my_workflow(ctx: Context) -> Result<(), EngineError> {
     ///     Ok(())
     /// }
     ///
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("my-workflow", my_workflow);
+    /// engine.register(&MY_WF, my_workflow);
     /// ```
-    pub fn register<F, Fut>(&mut self, name: impl Into<String>, workflow: F) -> Registration<'_>
+    pub fn register<I, O, M, W>(
+        &mut self,
+        def: &crate::context::WorkflowDef<I, O>,
+        workflow: W,
+    ) -> Registration<'_>
     where
-        F: Fn(Context) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), EngineError>> + Send + 'static,
+        W: super::workflow::IntoWorkflow<I, O, M>,
     {
         assert!(
             !self.running.load(Ordering::Acquire),
             "cannot register workflows after the engine has started"
         );
-        let name = name.into();
-        assert!(
-            !name.contains('/'),
-            "workflow name must not contain '/': '{name}'"
-        );
+        let name = def.name().to_string();
         info!(%name, "registered workflow");
         self.workflows
-            .insert(name.clone(), Arc::new(move |ctx| Box::pin(workflow(ctx))));
+            .insert(name.clone(), workflow.into_workflow_fn());
         Registration { engine: self, name }
     }
 
@@ -247,7 +251,7 @@ impl Engine {
                         "auto-resuming workflow instance"
                     );
                     match self
-                        .spawn_workflow(workflow_name, instance_id.clone(), None)
+                        .spawn_workflow::<()>(workflow_name, instance_id.clone(), None)
                         .await
                     {
                         Ok(_) => {}
@@ -268,9 +272,10 @@ impl Engine {
 
     /// Invokes a registered workflow, creating a new instance.
     ///
-    /// Returns an [`InvocationBuilder`] that can be awaited directly or
-    /// chained with [`.input(payload)`](InvocationBuilder::input) to pass
-    /// typed data the workflow reads via [`Context::input`].
+    /// Returns an [`InvocationBuilder`] that carries the input and output
+    /// types from the [`WorkflowDef`]. For workflows that require input,
+    /// call [`.input(payload)`](InvocationBuilder::input) before `.await`
+    /// — the compiler enforces this.
     ///
     /// A unique instance ID is generated automatically. The workflow runs
     /// in a spawned Tokio task.
@@ -285,28 +290,29 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
-    /// # async fn greet(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    /// use memable::{Engine, Context, EngineError, WorkflowDef};
+    ///
+    /// const GREET: WorkflowDef = WorkflowDef::new("greet");
+    ///
+    /// async fn greet(ctx: Context) -> Result<(), EngineError> { Ok(()) }
+    ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("greet", greet);
-    /// # engine.start().await?;
-    /// // Without input:
-    /// let invocation = engine.invoke("greet").await?;
-    /// println!("Started instance {}", invocation.instance_id());
+    /// let mut engine = Engine::builder().in_memory().build();
+    /// engine.register(&GREET, greet);
+    /// engine.start().await?;
     ///
-    /// // With input:
-    /// let invocation = engine.invoke("greet").input(42_i32).await?;
+    /// engine.invoke(&GREET).await?.wait().await.unwrap_completed();
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
-    pub fn invoke(&self, workflow_name: impl Into<String>) -> InvocationBuilder<'_> {
+    pub fn invoke<I, O>(&self, def: &WorkflowDef<I, O>) -> InvocationBuilder<'_, I, O> {
         InvocationBuilder {
             engine: self,
-            workflow_name: workflow_name.into(),
+            workflow_name: def.name().to_string(),
             input_payload: Ok(None),
+            _marker: PhantomData,
         }
     }
 
@@ -320,36 +326,36 @@ impl Engine {
     ///
     /// Returns [`EngineError::NotStarted`] if the engine has not been started,
     /// [`EngineError::WorkflowNotFound`] if no workflow is registered
-    /// under the given name, or [`EngineError::InvalidKey`] if `workflow_name`
-    /// or `instance_id` contains `/`.
+    /// under the given name, or [`EngineError::InvalidKey`] if
+    /// `instance_id` contains `/`.
     ///
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// # let invocation = engine.invoke("wf").await?;
+    /// # let invocation = engine.invoke(&WF).await?;
     /// # let instance_id = invocation.instance_id().to_string();
+    /// # invocation.wait().await;
     /// // Resume a failed instance — memoised steps are skipped.
-    /// let invocation = engine.resume("wf", &instance_id).await?;
+    /// let invocation = engine.resume(&WF, &instance_id).await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn resume(
+    pub async fn resume<I, O>(
         &self,
-        workflow_name: impl Into<String>,
+        def: &WorkflowDef<I, O>,
         instance_id: impl Into<String>,
-    ) -> Result<Invocation, EngineError> {
-        let workflow_name = workflow_name.into();
+    ) -> Result<Invocation<O>, EngineError> {
         let instance_id = instance_id.into();
-        validate_key_component(&workflow_name, "workflow_name")?;
         validate_key_component(&instance_id, "instance_id")?;
-        self.spawn_workflow(&workflow_name, instance_id, None).await
+        self.spawn_workflow(def.name(), instance_id, None).await
     }
 
     /// Delivers a signal payload to a suspended workflow step.
@@ -362,7 +368,7 @@ impl Engine {
     ///
     /// Returns [`EngineError::NotStarted`] if the engine has not been started,
     /// [`EngineError::WorkflowNotFound`] if no workflow is registered under
-    /// the given name, [`EngineError::InvalidKey`] if any component contains
+    /// the given name, [`EngineError::InvalidKey`] if `instance_id` contains
     /// `/`, [`EngineError::SignalRejected`] if the step does not exist or is
     /// not currently suspended, [`EngineError::SignalSuperseded`] if another
     /// caller already claimed the step, or [`EngineError::Storage`] /
@@ -371,7 +377,8 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, SuspendPoint, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, SuspendPoint, WorkflowDef};
+    /// const WF: WorkflowDef = WorkflowDef::new("approval");
     /// const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
     ///
     /// async fn approval(ctx: Context) -> Result<(), EngineError> {
@@ -383,29 +390,28 @@ impl Engine {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("approval", approval);
+    /// engine.register(&WF, approval);
     /// engine.start().await?;
     ///
-    /// let inv = engine.invoke("approval").await?;
+    /// let inv = engine.invoke(&WF).await?;
     /// let id = inv.instance_id().to_string();
     /// inv.wait().await;
     ///
-    /// let state = engine.signal("approval", &id, &APPROVAL, true).await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed(None));
+    /// engine.signal(&WF, &id, &APPROVAL, true).await?.wait().await.unwrap_completed();
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn signal<T>(
+    pub async fn signal<I, O, T>(
         &self,
-        workflow_name: &str,
+        def: &WorkflowDef<I, O>,
         instance_id: &str,
         point: &SuspendPoint<T>,
         payload: T,
-    ) -> Result<Invocation, EngineError>
+    ) -> Result<Invocation<O>, EngineError>
     where
         T: Serialize + DeserializeOwned + Send,
     {
-        validate_key_component(workflow_name, "workflow_name")?;
+        let workflow_name = def.name();
         validate_key_component(instance_id, "instance_id")?;
 
         let step_key = point.key();
@@ -453,6 +459,9 @@ impl Engine {
         Ok(Invocation {
             instance_id: instance_id.to_string(),
             status: rx,
+            db: Arc::clone(&self.db),
+            workflow_name: workflow_name.to_string(),
+            _marker: PhantomData,
         })
     }
 
@@ -477,26 +486,28 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState, SubscribeError};
+    /// # use memable::{Engine, Context, EngineError, WorkflowState, SubscribeError, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// let inv = engine.invoke("wf").await?;
+    /// let inv = engine.invoke(&WF).await?;
     /// let id = inv.instance_id().to_string();
     ///
-    /// let stream = engine.subscribe("wf", &id)?;
+    /// let stream = engine.subscribe(&WF, &id)?;
     /// // Use with StreamExt::next(), .map(), .take_while(), etc.
     /// # Ok(())
     /// # }
     /// ```
-    pub fn subscribe(
+    pub fn subscribe<I, O>(
         &self,
-        workflow_name: &str,
+        def: &WorkflowDef<I, O>,
         instance_id: &str,
     ) -> Result<StatusStream, SubscribeError> {
+        let workflow_name = def.name();
         let senders = self
             .senders
             .lock()
@@ -554,27 +565,29 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowState, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// let inv = engine.invoke("wf").await?;
+    /// let inv = engine.invoke(&WF).await?;
     /// let id = inv.instance_id().to_string();
     /// inv.wait().await;
     ///
-    /// let state = engine.state("wf", &id)?;
+    /// let state = engine.state(&WF, &id)?;
     /// assert_eq!(state, WorkflowState::Completed(None));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn state(
+    pub fn state<I, O>(
         &self,
-        workflow_name: &str,
+        def: &WorkflowDef<I, O>,
         instance_id: &str,
     ) -> Result<WorkflowState, StateError> {
+        let workflow_name = def.name();
         let senders = self
             .senders
             .lock()
@@ -616,28 +629,29 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, MetadataStatus};
+    /// # use memable::{Engine, Context, EngineError, MetadataStatus, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// let inv = engine.invoke("wf").await?;
+    /// let inv = engine.invoke(&WF).await?;
     /// let id = inv.instance_id().to_string();
     /// inv.wait().await;
     ///
-    /// let meta = engine.get_metadata("wf", &id)?.expect("instance exists");
+    /// let meta = engine.get_metadata(&WF, &id)?.expect("instance exists");
     /// assert_eq!(*meta.status(), MetadataStatus::Completed(None));
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_metadata(
+    pub fn get_metadata<I, O>(
         &self,
-        workflow_name: &str,
+        def: &WorkflowDef<I, O>,
         instance_id: &str,
     ) -> Result<Option<WorkflowMetadata>, EngineError> {
-        metadata::read_metadata(&self.db, workflow_name, instance_id)
+        metadata::read_metadata(&self.db, def.name(), instance_id)
     }
 
     /// Lists all instances of a workflow definition.
@@ -653,26 +667,27 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("wf", wf);
+    /// # engine.register(&WF, wf);
     /// # engine.start().await?;
-    /// engine.invoke("wf").await?.wait().await;
-    /// engine.invoke("wf").await?.wait().await;
+    /// engine.invoke(&WF).await?.wait().await;
+    /// engine.invoke(&WF).await?.wait().await;
     ///
-    /// let instances = engine.list_instances("wf")?;
+    /// let instances = engine.list_instances(&WF)?;
     /// assert_eq!(instances.len(), 2);
     /// # Ok(())
     /// # }
     /// ```
-    pub fn list_instances(
+    pub fn list_instances<I, O>(
         &self,
-        workflow_name: &str,
+        def: &WorkflowDef<I, O>,
     ) -> Result<Vec<(String, WorkflowMetadata)>, EngineError> {
-        metadata::list_metadata(&self.db, workflow_name)
+        metadata::list_metadata(&self.db, def.name())
     }
 
     /// Gracefully stops the engine.
@@ -693,15 +708,16 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
+    /// # const WF: WorkflowDef = WorkflowDef::new("wf");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("wf", wf);
+    /// engine.register(&WF, wf);
     /// engine.start().await?;
     ///
-    /// let _ = engine.invoke("wf").await?;
+    /// let _ = engine.invoke(&WF).await?;
     /// engine.stop().await;
     /// # Ok(())
     /// # }
@@ -754,16 +770,17 @@ impl Engine {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
+    /// # const GREET: WorkflowDef = WorkflowDef::new("greet");
     /// # async fn greet(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("greet", greet);
+    /// # engine.register(&GREET, greet);
     /// # engine.start().await?;
     /// // Fire-and-forget — no need to hold the Invocation handle.
-    /// let _ = engine.invoke("greet").await?;
-    /// let _ = engine.invoke("greet").await?;
+    /// let _ = engine.invoke(&GREET).await?;
+    /// let _ = engine.invoke(&GREET).await?;
     ///
     /// // All workflows will have completed when this returns.
     /// engine.wait_all().await;
@@ -784,12 +801,12 @@ impl Engine {
         info!("all workflows completed");
     }
 
-    pub(super) async fn spawn_workflow(
+    pub(super) async fn spawn_workflow<O>(
         &self,
         workflow_name: &str,
         instance_id: String,
         input_bytes: Option<Vec<u8>>,
-    ) -> Result<Invocation, EngineError> {
+    ) -> Result<Invocation<O>, EngineError> {
         validate_key_component(workflow_name, "workflow_name")?;
         let mut tasks = self.tasks.lock().await;
 
@@ -840,6 +857,9 @@ impl Engine {
         Ok(Invocation {
             instance_id,
             status: rx,
+            db: Arc::clone(&self.db),
+            workflow_name: workflow_name.to_string(),
+            _marker: PhantomData,
         })
     }
 
@@ -870,7 +890,9 @@ impl Engine {
 ///
 /// ```
 /// use std::time::Duration;
-/// use memable::{Engine, Context, EngineError};
+/// use memable::{Engine, Context, EngineError, WorkflowDef};
+///
+/// const EPHEMERAL: WorkflowDef = WorkflowDef::new("ephemeral");
 ///
 /// async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
 ///
@@ -880,7 +902,7 @@ impl Engine {
 ///     .build();
 ///
 /// // Override retention for this specific workflow:
-/// engine.register("ephemeral", wf).retention(Duration::from_secs(3600));
+/// engine.register(&EPHEMERAL, wf).retention(Duration::from_secs(3600));
 /// ```
 pub struct Registration<'a> {
     engine: &'a mut Engine,
@@ -897,7 +919,9 @@ impl Registration<'_> {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use memable::{Engine, Context, EngineError};
+    /// use memable::{Engine, Context, EngineError, WorkflowDef};
+    ///
+    /// const SHORT: WorkflowDef = WorkflowDef::new("short-lived");
     ///
     /// async fn wf(ctx: Context) -> Result<(), EngineError> { Ok(()) }
     ///
@@ -906,7 +930,7 @@ impl Registration<'_> {
     ///     .in_memory()
     ///     .build();
     ///
-    /// engine.register("short-lived", wf).retention(Duration::from_secs(3600));
+    /// engine.register(&SHORT, wf).retention(Duration::from_secs(3600));
     /// ```
     #[expect(clippy::must_use_candidate, clippy::return_self_not_must_use)]
     pub fn retention(self, ttl: Duration) -> Self {

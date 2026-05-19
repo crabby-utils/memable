@@ -182,6 +182,25 @@ pub enum EngineError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The workflow expected typed input but none was provided at invocation.
+    #[error("workflow '{workflow}' requires input but none was provided")]
+    InputMissing {
+        /// The workflow name.
+        workflow: String,
+    },
+
+    /// The workflow output is not available.
+    ///
+    /// This occurs when [`Completed::output`](crate::Completed::output)
+    /// is called but the output was not stored.
+    #[error("output not available for workflow '{workflow}' instance '{instance_id}'")]
+    OutputMissing {
+        /// The workflow name.
+        workflow: String,
+        /// The instance ID.
+        instance_id: String,
+    },
+
     /// The workflow suspended at a step, awaiting an external signal.
     #[error("workflow suspended at step '{key}'")]
     Suspended {

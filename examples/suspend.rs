@@ -4,12 +4,15 @@
 //! in-memory state, and later resume when an external signal delivers
 //! a payload. Memoised steps before the suspend point are not re-executed.
 
-use memable::{Context, Engine, EngineError, MetadataStatus, SuspendPoint, WorkflowState};
+use memable::{Context, Engine, EngineError, MetadataStatus, SuspendPoint, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+const APPROVAL: WorkflowDef = WorkflowDef::new("approval");
 
 /// Typed suspend point — encodes both the key and payload type at compile time.
 /// Both the workflow and the signal call reference this same const, ensuring
 /// they can never disagree on the key string or payload type.
-const APPROVAL: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
+const APPROVAL_POINT: SuspendPoint<bool> = SuspendPoint::new("approval:v1");
 
 /// A workflow that fetches data, suspends for approval, then processes
 /// the approved data.
@@ -28,11 +31,11 @@ async fn approval_workflow(ctx: Context) -> Result<(), EngineError> {
     // drops — nothing is held in memory. The engine records the
     // suspension in redb.
     //
-    // The APPROVAL const carries the payload type (bool). Both suspend
-    // and signal reference it, so key typos and type mismatches are
-    // caught at compile time.
+    // The APPROVAL_POINT const carries the payload type (bool). Both
+    // suspend and signal reference it, so key typos and type mismatches
+    // are caught at compile time.
     let approved: bool = ctx
-        .suspend(&APPROVAL)
+        .suspend(&APPROVAL_POINT)
         .status("Waiting for manager approval")
         .await?;
 
@@ -57,19 +60,22 @@ async fn approval_workflow(ctx: Context) -> Result<(), EngineError> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::builder().in_memory().build();
-    engine.register("approval", approval_workflow);
+
+    // Register using the WorkflowDef constant.
+    engine.register(&APPROVAL, approval_workflow);
     engine.start().await?;
 
     // Invoke the workflow. It will run until it hits the suspend point.
     println!("=== Invoking workflow ===");
-    let inv = engine.invoke("approval").await?;
+    let inv = engine.invoke(&APPROVAL).await?;
     let instance_id = inv.instance_id().to_string();
-    let state = inv.wait().await;
-    println!("State: {state}");
+    let result = inv.wait().await;
+    println!("State: {result}");
 
     // The metadata table shows the workflow is suspended.
+    // get_metadata takes a name string, so use DEF.name().
     let meta = engine
-        .get_metadata("approval", &instance_id)?
+        .get_metadata(&APPROVAL, &instance_id)?
         .expect("instance exists");
     println!("Metadata: {}", meta.status());
     assert!(matches!(
@@ -82,18 +88,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a CLI command, a webhook, etc. The engine writes the payload to redb
     // and re-runs the workflow from the top. Memoised steps return cached
     // results, and the suspend step resolves with the signal payload.
+    //
+    // signal() takes &WorkflowDef instead of a name string.
     println!("=== Sending approval signal ===");
-    let state = engine
-        .signal("approval", &instance_id, &APPROVAL, true)
-        .await?
-        .wait()
-        .await;
-    println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed(None));
+    let signal_inv = engine
+        .signal(&APPROVAL, &instance_id, &APPROVAL_POINT, true)
+        .await?;
+    let result = signal_inv.wait().await;
+    println!("State: {result}");
+    let _ = result.unwrap_completed();
 
     // After the signal, metadata reflects completion.
     let meta = engine
-        .get_metadata("approval", &instance_id)?
+        .get_metadata(&APPROVAL, &instance_id)?
         .expect("instance exists");
     println!("Metadata: {}", meta.status());
 

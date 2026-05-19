@@ -16,6 +16,76 @@ use crate::engine::WorkflowState;
 use crate::error::{EngineError, StepError};
 use crate::retry::RetryPolicy;
 
+/// A typed workflow definition that encodes the input and output types.
+///
+/// Define as a `const` and pass to [`Engine::register`](crate::Engine::register),
+/// [`Engine::invoke`](crate::Engine::invoke), [`Engine::resume`](crate::Engine::resume),
+/// and [`Engine::signal`](crate::Engine::signal) to get compile-time guarantees
+/// that all call sites agree on the workflow name and payload types.
+///
+/// # Examples
+///
+/// ```
+/// use memable::WorkflowDef;
+///
+/// const CLEANUP: WorkflowDef = WorkflowDef::new("cleanup");
+/// const GREETING: WorkflowDef<String, String> = WorkflowDef::new("greeting");
+/// ```
+pub struct WorkflowDef<I = (), O = ()> {
+    name: &'static str,
+    _marker: PhantomData<(I, O)>,
+}
+
+impl<I, O> WorkflowDef<I, O> {
+    /// Creates a new workflow definition with the given name.
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time (or runtime if not called in a const context)
+    /// if `name` contains `/` or starts with `_`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::WorkflowDef;
+    ///
+    /// const GREET: WorkflowDef<String, String> = WorkflowDef::new("greet");
+    /// assert_eq!(GREET.name(), "greet");
+    /// ```
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        let bytes = name.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            assert!(bytes[i] != b'/', "workflow name must not contain '/'");
+            i += 1;
+        }
+        assert!(
+            bytes.is_empty() || bytes[0] != b'_',
+            "workflow name must not start with '_'"
+        );
+        Self {
+            name,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the string name for this workflow definition.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::WorkflowDef;
+    ///
+    /// const WF: WorkflowDef = WorkflowDef::new("my-workflow");
+    /// assert_eq!(WF.name(), "my-workflow");
+    /// ```
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
 /// A typed suspend point that encodes both the step key and payload type.
 ///
 /// Define as a `const` and share between the workflow (via [`Context::suspend`])
@@ -244,7 +314,7 @@ impl Context {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
     /// # async fn check(ctx: Context) -> Result<(), EngineError> {
     ///     assert_eq!(ctx.workflow_name(), "my-workflow");
     /// #   Ok(())
@@ -252,9 +322,10 @@ impl Context {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("my-workflow", check);
+    /// # const MY_WF: WorkflowDef = WorkflowDef::new("my-workflow");
+    /// # engine.register(&MY_WF, check);
     /// # engine.start().await?;
-    /// # engine.invoke("my-workflow").await?.wait().await;
+    /// # engine.invoke(&MY_WF).await?.wait().await;
     /// # Ok(())
     /// # }
     /// ```
@@ -268,7 +339,7 @@ impl Context {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowState, WorkflowDef};
     /// # async fn check(ctx: Context) -> Result<(), EngineError> {
     ///     println!("Instance: {}", ctx.instance_id());
     /// #   Ok(())
@@ -276,9 +347,10 @@ impl Context {
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut engine = Engine::builder().in_memory().build();
-    /// # engine.register("check", check);
+    /// # const CHECK: WorkflowDef = WorkflowDef::new("check");
+    /// # engine.register(&CHECK, check);
     /// # engine.start().await?;
-    /// # engine.invoke("check").await?.wait().await;
+    /// # engine.invoke(&CHECK).await?.wait().await;
     /// # Ok(())
     /// # }
     /// ```
@@ -287,44 +359,13 @@ impl Context {
         &self.instance_id
     }
 
+    /// Returns a reference to the database handle.
+    pub(crate) fn db(&self) -> &Arc<Database> {
+        &self.db
+    }
+
     /// Reads the typed input payload provided at invocation time.
-    ///
-    /// Returns `Ok(Some(T))` when input was supplied via
-    /// [`InvocationBuilder::input`](crate::InvocationBuilder::input),
-    /// `Ok(None)` when the workflow was invoked without input,
-    /// or `Err` on type mismatch / deserialization failure.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError::TypeMismatch`] if the stored type does not
-    /// match `T`. Returns [`EngineError::Serialization`] on deserialization
-    /// failure.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use memable::{Engine, Context, EngineError, WorkflowState};
-    ///
-    /// async fn greet(ctx: Context) -> Result<(), EngineError> {
-    ///     let name: String = ctx.input::<String>()?.unwrap_or("world".into());
-    ///     let msg: String = ctx.step("greet:v1").run(async move || {
-    ///         Ok(format!("Hello, {name}!"))
-    ///     }).await?;
-    ///     Ok(())
-    /// }
-    ///
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("greet", greet);
-    /// engine.start().await?;
-    ///
-    /// let state = engine.invoke("greet").input("Alice".to_string()).await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed(None));
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn input<T: DeserializeOwned>(&self) -> Result<Option<T>, EngineError> {
+    pub(crate) fn input<T: DeserializeOwned>(&self) -> Result<Option<T>, EngineError> {
         let composite_key = format!("{}/{}/_input", self.workflow_name, self.instance_id);
         let Some(bytes) = self.read_step(&composite_key)? else {
             return Ok(None);
@@ -345,12 +386,13 @@ impl Context {
     /// # Examples
     ///
     /// ```
-    /// use memable::{Engine, Context, EngineError, WorkflowState};
+    /// use memable::{Engine, Context, EngineError, WorkflowDef};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// const PIPELINE: WorkflowDef = WorkflowDef::new("pipeline");
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("pipeline", |ctx: Context| async move {
+    /// engine.register(&PIPELINE, |ctx: Context| async move {
     ///     ctx.set_status("loading data");
     ///     let _: String = ctx.step("load:v1").run(async || {
     ///         Ok("data".to_string())
@@ -360,9 +402,8 @@ impl Context {
     /// });
     /// engine.start().await?;
     ///
-    /// let mut inv = engine.invoke("pipeline").await?;
-    /// let state = inv.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed(Some("processing".into())));
+    /// let c = engine.invoke(&PIPELINE).await?.wait().await.unwrap_completed();
+    /// assert_eq!(c.status(), Some("processing"));
     /// # Ok(())
     /// # }
     /// ```
@@ -397,12 +438,13 @@ impl Context {
     /// # Examples
     ///
     /// ```
-    /// use memable::{Engine, Context, EngineError, WorkflowState};
+    /// use memable::{Engine, Context, EngineError, WorkflowDef};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// const EXAMPLE: WorkflowDef = WorkflowDef::new("example");
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("example", |ctx: Context| async move {
+    /// engine.register(&EXAMPLE, |ctx: Context| async move {
     ///     // Simple step — no timeout.
     ///     let value: String = ctx.step("greet:v1").run(async || {
     ///         Ok("Hello, world!".to_string())
@@ -420,8 +462,7 @@ impl Context {
     ///     Ok(())
     /// });
     /// engine.start().await?;
-    /// let state = engine.invoke("example").await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed(None));
+    /// engine.invoke(&EXAMPLE).await?.wait().await.unwrap_completed();
     /// # Ok(())
     /// # }
     /// ```
@@ -910,11 +951,12 @@ impl StepBuilder<'_> {
     /// # Examples
     ///
     /// ```
-    /// # use memable::{Engine, Context, EngineError, WorkflowState};
+    /// # use memable::{Engine, Context, EngineError, WorkflowDef};
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// const EXAMPLE: WorkflowDef = WorkflowDef::new("example");
     /// let mut engine = Engine::builder().in_memory().build();
-    /// engine.register("example", |ctx: Context| async move {
+    /// engine.register(&EXAMPLE, |ctx: Context| async move {
     ///     let value: i32 = ctx.step("add:v1").run(async || {
     ///         Ok(1 + 2)
     ///     }).await?;
@@ -922,8 +964,7 @@ impl StepBuilder<'_> {
     ///     Ok(())
     /// });
     /// engine.start().await?;
-    /// let state = engine.invoke("example").await?.wait().await;
-    /// assert_eq!(state, WorkflowState::Completed(None));
+    /// engine.invoke(&EXAMPLE).await?.wait().await.unwrap_completed();
     /// # Ok(())
     /// # }
     /// ```

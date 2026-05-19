@@ -11,7 +11,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use memable::{Context, Engine, EngineError, MetadataStatus, StepError, WorkflowState};
+use memable::{Context, Engine, EngineError, MetadataStatus, StepError, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+const PIPELINE: WorkflowDef = WorkflowDef::new("pipeline");
 
 /// Tracks how many times the slow step has been attempted.
 static FETCH_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
@@ -61,18 +64,21 @@ async fn resilient_pipeline(ctx: Context) -> Result<(), EngineError> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::builder().in_memory().build();
-    engine.register("pipeline", resilient_pipeline);
+
+    // Register using the WorkflowDef constant.
+    engine.register(&PIPELINE, resilient_pipeline);
     engine.start().await?;
 
     // First invocation — the fetch step times out after 500ms.
     println!("=== First invocation (fetch will time out) ===");
-    let inv = engine.invoke("pipeline").await?;
+    let inv = engine.invoke(&PIPELINE).await?;
     let id = inv.instance_id().to_string();
-    let state = inv.wait().await;
-    println!("State: {state}");
+    let result = inv.wait().await;
+    println!("State: {result}");
 
+    // get_metadata takes a name string, so use DEF.name().
     let meta = engine
-        .get_metadata("pipeline", &id)?
+        .get_metadata(&PIPELINE, &id)?
         .expect("instance exists");
     println!("Metadata: {}", meta.status());
     assert!(matches!(meta.status(), MetadataStatus::Failed(msg) if msg.contains("timed out")));
@@ -80,10 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resume — the timed-out step was NOT cached, so it re-executes.
     // This time the simulated upstream responds quickly.
+    // resume() takes &WorkflowDef instead of a name string.
     println!("=== Resume (fetch re-executes, succeeds) ===");
-    let state = engine.resume("pipeline", &id).await?.wait().await;
-    println!("State: {state}");
-    assert_eq!(state, WorkflowState::Completed(None));
+    let state_inv = engine.resume(&PIPELINE, &id).await?;
+    let result = state_inv.wait().await;
+    println!("State: {result}");
+    let _ = result.unwrap_completed();
 
     // The fetch step ran twice total (timed out + retry).
     println!("Fetch attempts: {}", FETCH_ATTEMPTS.load(Ordering::Relaxed));

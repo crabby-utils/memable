@@ -3,7 +3,10 @@
 //! Demonstrates how an external observer can watch a workflow's progress
 //! in real time using `Invocation::into_parts()` and the status channel.
 
-use memable::{Context, Engine, EngineError};
+use memable::{Context, Engine, EngineError, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+const DATA_PIPELINE: WorkflowDef = WorkflowDef::new("data-pipeline");
 
 /// A multi-step "data pipeline" that reports progress via `ctx.set_status()`.
 async fn data_pipeline(ctx: Context) -> Result<(), EngineError> {
@@ -51,12 +54,15 @@ async fn data_pipeline(ctx: Context) -> Result<(), EngineError> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = Engine::builder().in_memory().build();
-    engine.register("data-pipeline", data_pipeline);
+
+    // Register using the WorkflowDef constant.
+    engine.register(&DATA_PIPELINE, data_pipeline);
     engine.start().await?;
 
     // Split the invocation into an ID and a status receiver so we can
     // monitor progress from a separate task.
-    let (instance_id, mut status_rx) = engine.invoke("data-pipeline").await?.into_parts();
+    // invoke() now takes &WorkflowDef instead of a name string.
+    let (instance_id, mut status_rx) = engine.invoke(&DATA_PIPELINE).await?.into_parts();
 
     // Spawn a monitoring task that prints every status transition.
     // Use message() to get the raw text passed to set_status(), rather

@@ -10,7 +10,10 @@
 
 use std::time::Duration;
 
-use memable::{Context, Engine, EngineError, MetadataStatus};
+use memable::{Context, Engine, EngineError, MetadataStatus, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+const PIPELINE: WorkflowDef = WorkflowDef::new("pipeline");
 
 /// A pipeline with a slow processing step. When `stop()` is called during
 /// execution, the engine waits for the in-progress step to finish (up to
@@ -53,14 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .in_memory()
         .shutdown_timeout(Duration::from_secs(3))
         .build();
-    engine.register("pipeline", pipeline);
+
+    // Register using the WorkflowDef constant.
+    engine.register(&PIPELINE, pipeline);
     engine.start().await?;
 
     // Invoke two workflows. They'll start executing immediately.
+    // invoke() now takes &WorkflowDef instead of a name string.
     println!("=== Invoking workflows ===");
-    let inv1 = engine.invoke("pipeline").await?;
+    let inv1 = engine.invoke(&PIPELINE).await?;
     let id1 = inv1.instance_id().to_string();
-    let inv2 = engine.invoke("pipeline").await?;
+    let inv2 = engine.invoke(&PIPELINE).await?;
     let id2 = inv2.instance_id().to_string();
 
     // Give them a moment to start, then initiate graceful shutdown.
@@ -72,16 +78,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // After stop, check metadata — workflows that completed within the
     // timeout have Completed status; any that were aborted would have
     // Running status (recoverable on next start).
+    // get_metadata takes a name string, so use DEF.name().
     println!("\n=== Final state ===");
     for (label, id) in [("workflow 1", &id1), ("workflow 2", &id2)] {
-        if let Some(meta) = engine.get_metadata("pipeline", id)? {
+        if let Some(meta) = engine.get_metadata(&PIPELINE, id)? {
             println!("  {label}: {}", meta.status());
             assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
         }
     }
 
     // After stop, new invocations are rejected.
-    let result = engine.invoke("pipeline").await;
+    let result = engine.invoke(&PIPELINE).await;
     assert!(matches!(result, Err(EngineError::NotStarted)));
     println!("  invoke after stop: correctly rejected");
 

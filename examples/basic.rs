@@ -1,6 +1,11 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use memable::{Context, Engine, EngineError, MetadataStatus, StepError};
+use memable::{Context, Engine, EngineError, MetadataStatus, StepError, WorkflowDef};
+
+/// Define the workflow name as a compile-time constant.
+/// All register/invoke/resume/metadata calls reference this constant,
+/// so typos and mismatches are caught at compile time.
+const GREETING: WorkflowDef = WorkflowDef::new("greeting");
 
 static STEP_EXECUTIONS: AtomicU32 = AtomicU32::new(0);
 static FORMAT_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
@@ -39,24 +44,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let mut engine = Engine::builder().in_memory().build();
-    engine.register("greeting", greeting_workflow);
+
+    // Register the workflow using its WorkflowDef constant.
+    engine.register(&GREETING, greeting_workflow);
     engine.start().await?;
 
     // First invocation — step 1 succeeds, step 2 hits a transient failure.
     println!("=== First invocation ===");
 
-    let inv = engine.invoke("greeting").await?;
+    let inv = engine.invoke(&GREETING).await?;
     let instance_id = inv.instance_id().to_string();
-    let state = inv.wait().await;
-    println!("Status: {state}");
+    let result = inv.wait().await;
+    println!("Status: {result}");
     println!(
         "Steps executed: {}",
         STEP_EXECUTIONS.load(Ordering::Relaxed)
     );
 
     // Query metadata — the engine recorded the failure.
+    // get_metadata takes a workflow name string, so use DEF.name().
     let meta = engine
-        .get_metadata("greeting", &instance_id)?
+        .get_metadata(&GREETING, &instance_id)?
         .expect("instance exists");
     println!("Metadata: {} at {:?}", meta.status(), meta.completed_at());
     println!();
@@ -67,8 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Resume (step 1 memoised, step 2 retries) ===");
     STEP_EXECUTIONS.store(0, Ordering::Relaxed);
 
-    let state = engine.resume("greeting", &instance_id).await?.wait().await;
-    println!("Status: {state}");
+    // resume() takes &WorkflowDef instead of a name string.
+    let state_inv = engine.resume(&GREETING, &instance_id).await?;
+    let result = state_inv.wait().await;
+    println!("Status: {result}");
     println!(
         "Steps executed: {} (step 1 was memoised!)",
         STEP_EXECUTIONS.load(Ordering::Relaxed)
@@ -76,13 +86,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // After resume, metadata reflects success.
     let meta = engine
-        .get_metadata("greeting", &instance_id)?
+        .get_metadata(&GREETING, &instance_id)?
         .expect("instance exists");
     println!("Metadata: {} at {:?}", meta.status(), meta.completed_at());
     assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
 
-    // list_instances shows all instances of a workflow definition.
-    let instances = engine.list_instances("greeting")?;
+    // list_instances takes a workflow name string, so use DEF.name().
+    let instances = engine.list_instances(&GREETING)?;
     println!("\nAll 'greeting' instances: {}", instances.len());
     for (id, meta) in &instances {
         println!("  {id}: {}", meta.status());

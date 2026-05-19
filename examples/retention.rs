@@ -10,7 +10,11 @@
 
 use std::time::Duration;
 
-use memable::{Context, Engine, EngineError, WorkflowState};
+use memable::{Context, Engine, EngineError, WorkflowDef, WorkflowState};
+
+/// Define workflow names as compile-time constants.
+const DATA_PIPELINE: WorkflowDef = WorkflowDef::new("data-pipeline");
+const HEALTH_CHECK: WorkflowDef = WorkflowDef::new("health-check");
 
 /// A workflow that processes data in multiple steps.
 async fn data_pipeline(ctx: Context) -> Result<(), EngineError> {
@@ -60,12 +64,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     // Register the data pipeline with the default engine retention (30 days).
-    engine.register("data-pipeline", data_pipeline);
+    // register() now takes &WorkflowDef instead of a name string.
+    engine.register(&DATA_PIPELINE, data_pipeline);
 
     // Register health checks with a shorter retention — results are
     // ephemeral and only needed for a few hours.
     engine
-        .register("health-check", health_check)
+        .register(&HEALTH_CHECK, health_check)
         .retention(Duration::from_secs(4 * 60 * 60)); // 4 hours
 
     engine.start().await?;
@@ -73,17 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run some workflows.
     println!("=== Running workflows ===\n");
 
-    let pipeline_inv = engine.invoke("data-pipeline").await?;
+    // invoke() now takes &WorkflowDef instead of a name string.
+    let pipeline_inv = engine.invoke(&DATA_PIPELINE).await?;
     let pipeline_id = pipeline_inv.instance_id().to_string();
     pipeline_inv.wait().await;
 
-    let health_inv = engine.invoke("health-check").await?;
+    let health_inv = engine.invoke(&HEALTH_CHECK).await?;
     let health_id = health_inv.instance_id().to_string();
     health_inv.wait().await;
 
     // Both workflows are completed and visible in metadata.
+    // get_metadata takes a name string, so use DEF.name().
     println!("\n=== After completion ===");
-    let pipeline_meta = engine.get_metadata("data-pipeline", &pipeline_id)?;
+    let pipeline_meta = engine.get_metadata(&DATA_PIPELINE, &pipeline_id)?;
     println!(
         "  data-pipeline: {}",
         pipeline_meta
@@ -91,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_or("gone".into(), |m| m.status().to_string())
     );
 
-    let health_meta = engine.get_metadata("health-check", &health_id)?;
+    let health_meta = engine.get_metadata(&HEALTH_CHECK, &health_id)?;
     println!(
         "  health-check:  {}",
         health_meta
@@ -118,12 +125,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  cleanup scope:           metadata + steps + timers");
 
     // Verify workflows are still accessible (they just completed, not yet expired).
+    // state() takes a name string, so use DEF.name().
     assert_eq!(
-        engine.state("data-pipeline", &pipeline_id)?,
+        engine.state(&DATA_PIPELINE, &pipeline_id)?,
         WorkflowState::Completed(None)
     );
     assert_eq!(
-        engine.state("health-check", &health_id)?,
+        engine.state(&HEALTH_CHECK, &health_id)?,
         WorkflowState::Completed(None)
     );
 
