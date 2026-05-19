@@ -10,7 +10,7 @@ use tracing::{Instrument as _, error, info, info_span};
 use super::workflow::{read_output, write_output};
 use super::{EngineShared, WorkflowState};
 use crate::context::{Context, StepData, deserialize_step};
-use crate::error::EngineError;
+use crate::error::{ChildError, EngineError};
 use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 
 use super::execution::handle_workflow_result;
@@ -22,19 +22,19 @@ pub(crate) struct FanOutManifest {
     pub count: usize,
 }
 
-/// Run an inline-closure fan-out.
+/// Spawn inline-closure child tasks into a `JoinSet`.
 ///
-/// The parent task stays alive while children execute in a local
-/// `JoinSet`. A semaphore enforces the concurrency limit. Results
-/// are collected in item order.
-pub(crate) async fn run_inline<I, T, F, Fut>(
+/// Each child gets its own [`Context`], writes metadata, and runs the
+/// closure. The semaphore enforces the concurrency limit. Tasks return
+/// `(index, Result<T, EngineError>)` so the index is always available.
+pub(crate) fn spawn_inline_tasks<I, T, F, Fut>(
     shared: &Arc<EngineShared>,
     parent_wf_name: &str,
     child_ids: &[String],
     items: Vec<I>,
-    closure: Arc<F>,
+    closure: &Arc<F>,
     concurrency: usize,
-) -> Result<Vec<T>, EngineError>
+) -> JoinSet<(usize, Result<T, EngineError>)>
 where
     F: Fn(Context, I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<T, EngineError>> + Send + 'static,
@@ -42,13 +42,13 @@ where
     T: Serialize + DeserializeOwned + Send + 'static,
 {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut child_tasks: JoinSet<Result<(usize, T), EngineError>> = JoinSet::new();
+    let mut child_tasks: JoinSet<(usize, Result<T, EngineError>)> = JoinSet::new();
 
     for (idx, (child_id, item)) in child_ids.iter().zip(items).enumerate() {
         let shared_c = Arc::clone(shared);
         let wf_name = parent_wf_name.to_string();
         let cid = child_id.clone();
-        let f = Arc::clone(&closure);
+        let f = Arc::clone(closure);
         let sem = Arc::clone(&semaphore);
         let span = info_span!("child_workflow", name = %wf_name, instance = %cid);
 
@@ -85,7 +85,10 @@ where
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&cid);
-                        return Err(EngineError::Storage("child output write failed".into()));
+                        return (
+                            idx,
+                            Err(EngineError::Storage("child output write failed".into())),
+                        );
                     }
                 }
 
@@ -110,28 +113,28 @@ where
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&cid);
 
-                result.map(|val| (idx, val))
+                (idx, result)
             }
             .instrument(span),
         );
     }
 
-    collect_results(child_tasks, child_ids.len()).await
+    child_tasks
 }
 
-/// Run a registered-workflow fan-out.
-pub(crate) async fn run_workflow<T>(
+/// Spawn registered-workflow child tasks into a `JoinSet`.
+pub(crate) fn spawn_workflow_tasks<T>(
     shared: &Arc<EngineShared>,
     child_workflow_name: &str,
     child_ids: &[String],
     items_bytes: Vec<Vec<u8>>,
     concurrency: usize,
-) -> Result<Vec<T>, EngineError>
+) -> JoinSet<(usize, Result<T, EngineError>)>
 where
     T: Serialize + DeserializeOwned + Send + 'static,
 {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let mut child_tasks: JoinSet<Result<(usize, T), EngineError>> = JoinSet::new();
+    let mut child_tasks: JoinSet<(usize, Result<T, EngineError>)> = JoinSet::new();
 
     for (idx, (child_id, input_bytes)) in child_ids.iter().zip(items_bytes).enumerate() {
         let shared_c = Arc::clone(shared);
@@ -142,58 +145,63 @@ where
         child_tasks.spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
 
-            let invocation = super::Engine::spawn_workflow::<()>(
-                &shared_c,
-                &wf_name,
-                cid.clone(),
-                Some(input_bytes),
-            )
-            .await?;
+            let result: Result<T, EngineError> = async {
+                let invocation = super::Engine::spawn_workflow::<()>(
+                    &shared_c,
+                    &wf_name,
+                    cid.clone(),
+                    Some(input_bytes),
+                )
+                .await?;
 
-            let (_id, mut rx) = invocation.into_parts();
+                let (_id, mut rx) = invocation.into_parts();
 
-            loop {
-                {
-                    let state = rx.borrow().clone();
-                    if state.is_terminal() {
+                loop {
+                    {
+                        let state = rx.borrow().clone();
+                        if state.is_terminal() {
+                            return match state {
+                                WorkflowState::Completed(_) => {
+                                    let value: T = read_output(&shared_c.db, &wf_name, &cid)?;
+                                    Ok(value)
+                                }
+                                WorkflowState::Failed(msg) => Err(EngineError::StepFailed {
+                                    key: cid,
+                                    source: msg.into(),
+                                    retryable: false,
+                                }),
+                                _ => unreachable!(),
+                            };
+                        }
+                    }
+                    if rx.changed().await.is_err() {
+                        let state = rx.borrow().clone();
                         return match state {
                             WorkflowState::Completed(_) => {
                                 let value: T = read_output(&shared_c.db, &wf_name, &cid)?;
-                                Ok((idx, value))
+                                Ok(value)
                             }
-                            WorkflowState::Failed(msg) => Err(EngineError::StepFailed {
+                            other => Err(EngineError::StepFailed {
                                 key: cid,
-                                source: msg.into(),
+                                source: format!("child ended in state: {other}").into(),
                                 retryable: false,
                             }),
-                            _ => unreachable!(),
                         };
                     }
                 }
-                if rx.changed().await.is_err() {
-                    let state = rx.borrow().clone();
-                    return match state {
-                        WorkflowState::Completed(_) => {
-                            let value: T = read_output(&shared_c.db, &wf_name, &cid)?;
-                            Ok((idx, value))
-                        }
-                        other => Err(EngineError::StepFailed {
-                            key: cid,
-                            source: format!("child ended in state: {other}").into(),
-                            retryable: false,
-                        }),
-                    };
-                }
             }
+            .await;
+
+            (idx, result)
         });
     }
 
-    collect_results(child_tasks, child_ids.len()).await
+    child_tasks
 }
 
-/// Collect results from a `JoinSet`, failing immediately on first error.
-async fn collect_results<T: Send + 'static>(
-    mut child_tasks: JoinSet<Result<(usize, T), EngineError>>,
+/// Collect results in fail-fast mode: abort all remaining on first error.
+pub(crate) async fn collect_fail_fast<T: Send + 'static>(
+    mut child_tasks: JoinSet<(usize, Result<T, EngineError>)>,
     expected: usize,
 ) -> Result<Vec<T>, EngineError> {
     let mut indexed: Vec<Option<T>> = (0..expected).map(|_| None).collect();
@@ -201,11 +209,11 @@ async fn collect_results<T: Send + 'static>(
 
     while let Some(join_result) = child_tasks.join_next().await {
         match join_result {
-            Ok(Ok((idx, value))) => {
+            Ok((idx, Ok(value))) => {
                 indexed[idx] = Some(value);
                 completed += 1;
             }
-            Ok(Err(e)) => {
+            Ok((_idx, Err(e))) => {
                 info!(
                     error = %e,
                     completed,
@@ -214,6 +222,38 @@ async fn collect_results<T: Send + 'static>(
                 );
                 child_tasks.abort_all();
                 return Err(e);
+            }
+            Err(join_err) => {
+                error!(error = %join_err, "child task panicked");
+                child_tasks.abort_all();
+                return Err(EngineError::Storage(
+                    format!("child task panicked: {join_err}").into(),
+                ));
+            }
+        }
+    }
+
+    Ok(indexed
+        .into_iter()
+        .map(|v| v.expect("all children completed"))
+        .collect())
+}
+
+/// Collect results in collect-all mode: run every child to completion.
+pub(crate) async fn collect_all<T: Send + 'static>(
+    mut child_tasks: JoinSet<(usize, Result<T, EngineError>)>,
+    expected: usize,
+    child_ids: &[String],
+) -> Result<Vec<Result<T, ChildError>>, EngineError> {
+    let mut indexed: Vec<Option<Result<T, ChildError>>> = (0..expected).map(|_| None).collect();
+
+    while let Some(join_result) = child_tasks.join_next().await {
+        match join_result {
+            Ok((idx, Ok(value))) => {
+                indexed[idx] = Some(Ok(value));
+            }
+            Ok((idx, Err(e))) => {
+                indexed[idx] = Some(Err(ChildError::new(&child_ids[idx], e.to_string())));
             }
             Err(join_err) => {
                 error!(error = %join_err, "child task panicked");

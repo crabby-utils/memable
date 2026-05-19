@@ -98,12 +98,15 @@ mod metadata;
 mod retry;
 mod stream;
 
-pub use context::{Context, FanOutBuilder, StepBuilder, SuspendBuilder, SuspendPoint, WorkflowDef};
+pub use context::{
+    CollectAll, Context, FailFast, FanOutBuilder, StepBuilder, SuspendBuilder, SuspendPoint,
+    WorkflowDef,
+};
 pub use engine::{
     Completed, Engine, EngineBuilder, HasStore, IntoWorkflow, Invocation, InvocationBuilder,
     NoStore, Registration, WaitResult, WorkflowState,
 };
-pub use error::{EngineError, StateError, StepError, SubscribeError};
+pub use error::{ChildError, EngineError, StateError, StepError, SubscribeError};
 pub use metadata::{MetadataStatus, WorkflowMetadata};
 pub use retry::RetryPolicy;
 pub use stream::StatusStream;

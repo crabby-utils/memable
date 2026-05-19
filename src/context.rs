@@ -735,11 +735,12 @@ impl Context {
     /// # Examples
     ///
     /// ```no_run
-    /// use memable::{Context, EngineError};
+    /// use memable::{Context, EngineError, ChildError};
     ///
     /// async fn pipeline(ctx: Context) -> Result<(), EngineError> {
     ///     let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    ///     let results: Vec<String> = ctx.fan_out("process:v1", items)
+    ///     // Default is collect-all: returns Vec<Result<T, ChildError>>
+    ///     let results: Vec<Result<String, ChildError>> = ctx.fan_out("process:v1", items)
     ///         .concurrency(2)
     ///         .run(|child_ctx, item| async move {
     ///             let upper: String = child_ctx.step("upper:v1")
@@ -747,12 +748,22 @@ impl Context {
     ///                 .await?;
     ///             Ok(upper)
     ///         }).await?;
-    ///     assert_eq!(results, vec!["A", "B", "C"]);
+    ///
+    ///     // Use .fail_fast() for Result<Vec<T>, EngineError>
+    ///     let items2 = vec!["x".to_string()];
+    ///     let fast: Vec<String> = ctx.fan_out("fast:v1", items2)
+    ///         .fail_fast()
+    ///         .run(|child_ctx, item| async move { Ok(item) })
+    ///         .await?;
     ///     Ok(())
     /// }
     /// ```
     #[must_use]
-    pub fn fan_out<'a, I>(&'a self, key: &'a str, items: Vec<I>) -> FanOutBuilder<'a, I> {
+    pub fn fan_out<'a, I>(
+        &'a self,
+        key: &'a str,
+        items: Vec<I>,
+    ) -> FanOutBuilder<'a, I, CollectAll> {
         assert!(
             !key.contains('/'),
             "fan_out key must not contain '/': '{key}'"
@@ -762,6 +773,7 @@ impl Context {
             key,
             items,
             concurrency: None,
+            _mode: PhantomData,
         }
     }
 
@@ -1158,12 +1170,30 @@ impl StepBuilder<'_> {
     }
 }
 
+/// Marker type for collect-all error mode (the default).
+///
+/// All children run to completion. The fan-out returns
+/// `Vec<Result<T, ChildError>>` so the caller can inspect individual
+/// successes and failures.
+pub struct CollectAll;
+
+/// Marker type for fail-fast error mode.
+///
+/// On the first child terminal failure, remaining children are cancelled
+/// and the error is propagated immediately as `EngineError`.
+pub struct FailFast;
+
 /// Builder for a fan-out operation that spawns child workflows.
 ///
 /// Created by [`Context::fan_out`]. Chain
 /// [`.concurrency(n)`](FanOutBuilder::concurrency) to limit parallelism,
 /// then call [`.run(closure)`](FanOutBuilder::run) for inline closures or
 /// [`.workflow(&DEF)`](FanOutBuilder::workflow) for registered workflows.
+///
+/// The default error mode is [`CollectAll`] — all children run to
+/// completion and results include both successes and failures. Call
+/// [`.fail_fast()`](FanOutBuilder::fail_fast) to switch to [`FailFast`]
+/// mode, which cancels remaining children on the first failure.
 ///
 /// # Examples
 ///
@@ -1172,7 +1202,8 @@ impl StepBuilder<'_> {
 ///
 /// async fn pipeline(ctx: Context) -> Result<(), EngineError> {
 ///     let items = vec![1, 2, 3];
-///     let results: Vec<i32> = ctx.fan_out("double:v1", items)
+///     // Collect-all (default): returns Vec<Result<T, ChildError>>
+///     let results = ctx.fan_out("double:v1", items)
 ///         .concurrency(2)
 ///         .run(|child_ctx, item| async move {
 ///             let doubled: i32 = child_ctx.step("calc:v1")
@@ -1180,18 +1211,26 @@ impl StepBuilder<'_> {
 ///                 .await?;
 ///             Ok(doubled)
 ///         }).await?;
-///     assert_eq!(results, vec![2, 4, 6]);
+///     for r in &results {
+///         match r {
+///             Ok(v) => println!("got {v}"),
+///             Err(e) => println!("child {} failed: {}", e.instance_id(), e.message()),
+///         }
+///     }
 ///     Ok(())
 /// }
 /// ```
-pub struct FanOutBuilder<'a, I> {
+pub struct FanOutBuilder<'a, I, Mode = CollectAll> {
     ctx: &'a Context,
     key: &'a str,
     items: Vec<I>,
     concurrency: Option<usize>,
+    _mode: PhantomData<Mode>,
 }
 
-impl<I> FanOutBuilder<'_, I> {
+// ── Shared methods (available in any error mode) ────────────────────
+
+impl<I, Mode> FanOutBuilder<'_, I, Mode> {
     /// Limits the number of children executing concurrently.
     ///
     /// If not set, all children run in parallel.
@@ -1201,7 +1240,7 @@ impl<I> FanOutBuilder<'_, I> {
     /// ```no_run
     /// # use memable::{Context, EngineError};
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
-    /// let results: Vec<String> = ctx.fan_out("batch:v1", vec!["a".into(), "b".into()])
+    /// let results = ctx.fan_out("batch:v1", vec!["a".to_string(), "b".to_string()])
     ///     .concurrency(1)
     ///     .run(|child_ctx, item: String| async move { Ok(item) })
     ///     .await?;
@@ -1214,21 +1253,232 @@ impl<I> FanOutBuilder<'_, I> {
         self
     }
 
-    /// Executes the fan-out with an inline closure.
+    fn write_manifest(
+        &self,
+        fan_out_step_key: &str,
+        child_ids: &[String],
+    ) -> Result<(), EngineError> {
+        let manifest_step_key = fan_out_step_key.replace("_fanout:", "_fanout_manifest:");
+        let manifest = crate::engine::fan_out::FanOutManifest {
+            child_instance_ids: child_ids.to_vec(),
+            count: child_ids.len(),
+        };
+        let manifest_data = StepData::Completed {
+            result: manifest,
+            status: None,
+        };
+        let manifest_composite = format!(
+            "{}/{}/{}",
+            self.ctx.workflow_name, self.ctx.instance_id, manifest_step_key
+        );
+        let manifest_bytes = serialize_step(&manifest_data, &manifest_step_key)?;
+        self.ctx.write_step(&manifest_composite, &manifest_bytes)
+    }
+
+    fn child_ids(&self) -> Vec<String> {
+        (0..self.items.len())
+            .map(|idx| format!("{}/{}-{idx}", self.ctx.instance_id, self.key))
+            .collect()
+    }
+
+    fn effective_concurrency(&self) -> usize {
+        self.concurrency.unwrap_or(self.items.len().max(1))
+    }
+}
+
+// ── CollectAll mode ─────────────────────────────────────────────────
+
+impl<'a, I> FanOutBuilder<'a, I, CollectAll> {
+    /// Switches to fail-fast error mode.
     ///
-    /// Each item is paired with a fresh [`Context`] and passed to the
-    /// closure. The closure's return value is written as the child's
-    /// output. Results are collected in item order.
+    /// In fail-fast mode, the first child terminal failure cancels all
+    /// remaining children and the error is propagated immediately.
+    /// The return type changes from `Vec<Result<T, ChildError>>` to
+    /// `Vec<T>` (wrapped in `Result<_, EngineError>`).
     ///
-    /// The parent task stays alive while children execute concurrently.
-    /// If any child fails, remaining children are cancelled and the
-    /// error is propagated.
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results: Vec<String> = ctx.fan_out("batch:v1", vec!["a".to_string()])
+    ///     .fail_fast()
+    ///     .run(|child_ctx, item: String| async move { Ok(item) })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn fail_fast(self) -> FanOutBuilder<'a, I, FailFast> {
+        FanOutBuilder {
+            ctx: self.ctx,
+            key: self.key,
+            items: self.items,
+            concurrency: self.concurrency,
+            _mode: PhantomData,
+        }
+    }
+
+    /// Executes the fan-out with an inline closure (collect-all mode).
+    ///
+    /// All children run to completion regardless of individual failures.
+    /// Returns a `Vec<Result<T, ChildError>>` so the caller can inspect
+    /// each child's outcome independently.
     ///
     /// # Errors
     ///
-    /// Returns the child's error if any child fails. Returns
-    /// [`EngineError::Storage`] or [`EngineError::Serialization`] on
-    /// persistence failures.
+    /// Returns [`EngineError`] only for infrastructure failures (storage,
+    /// serialization, task panic). Individual child failures appear as
+    /// [`ChildError`](crate::ChildError) in the result vector.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results = ctx.fan_out("work:v1", vec![1, 2, 3])
+    ///     .run(|child_ctx, item| async move {
+    ///         let v: i32 = child_ctx.step("calc:v1")
+    ///             .run(async move || Ok(item * 2))
+    ///             .await?;
+    ///         Ok(v)
+    ///     }).await?;
+    /// let successes: Vec<i32> = results.into_iter().filter_map(Result::ok).collect();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run<F, T, Fut>(
+        self,
+        f: F,
+    ) -> Result<Vec<Result<T, crate::error::ChildError>>, EngineError>
+    where
+        F: Fn(Context, I) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<T, EngineError>> + Send + 'static,
+        I: Serialize + DeserializeOwned + Send + 'static,
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        use crate::engine::fan_out;
+
+        let fan_out_step_key = format!("_fanout:{}", self.key);
+
+        if let Some(cached) = fan_out::check_cached::<Result<T, crate::error::ChildError>>(
+            self.ctx,
+            &fan_out_step_key,
+        )? {
+            return Ok(cached);
+        }
+
+        self.ctx
+            .replaying
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let child_ids = self.child_ids();
+        let concurrency = self.effective_concurrency();
+        self.write_manifest(&fan_out_step_key, &child_ids)?;
+
+        let closure = std::sync::Arc::new(f);
+        let tasks = fan_out::spawn_inline_tasks(
+            &self.ctx.shared,
+            &self.ctx.workflow_name,
+            &child_ids,
+            self.items,
+            &closure,
+            concurrency,
+        );
+        let results = fan_out::collect_all(tasks, child_ids.len(), &child_ids).await?;
+
+        fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
+
+        Ok(results)
+    }
+
+    /// Executes the fan-out using a registered workflow (collect-all mode).
+    ///
+    /// Each item is serialized as the child workflow's input. All children
+    /// run to completion. Returns `Vec<Result<O, ChildError>>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] only for infrastructure failures.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError, WorkflowDef};
+    /// # const PROCESS: WorkflowDef<String, String> = WorkflowDef::new("process");
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results = ctx.fan_out("batch:v1", vec!["a".into(), "b".into()])
+    ///     .workflow(&PROCESS)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn workflow<O>(
+        self,
+        def: &WorkflowDef<I, O>,
+    ) -> Result<Vec<Result<O, crate::error::ChildError>>, EngineError>
+    where
+        I: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+    {
+        use crate::engine::fan_out;
+
+        let fan_out_step_key = format!("_fanout:{}", self.key);
+
+        if let Some(cached) = fan_out::check_cached::<Result<O, crate::error::ChildError>>(
+            self.ctx,
+            &fan_out_step_key,
+        )? {
+            return Ok(cached);
+        }
+
+        self.ctx
+            .replaying
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let child_workflow_name = def.name().to_string();
+        let child_ids = self.child_ids();
+        let concurrency = self.effective_concurrency();
+        self.write_manifest(&fan_out_step_key, &child_ids)?;
+
+        let mut items_bytes = Vec::with_capacity(self.items.len());
+        for item in self.items {
+            let data = StepData::Completed {
+                result: item,
+                status: None,
+            };
+            let bytes = serialize_step(&data, "_input")?;
+            items_bytes.push(bytes);
+        }
+
+        let tasks = fan_out::spawn_workflow_tasks::<O>(
+            &self.ctx.shared,
+            &child_workflow_name,
+            &child_ids,
+            items_bytes,
+            concurrency,
+        );
+        let results = fan_out::collect_all(tasks, child_ids.len(), &child_ids).await?;
+
+        fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
+
+        Ok(results)
+    }
+}
+
+// ── FailFast mode ───────────────────────────────────────────────────
+
+impl<I> FanOutBuilder<'_, I, FailFast> {
+    /// Executes the fan-out with an inline closure (fail-fast mode).
+    ///
+    /// On the first child terminal failure, remaining children are
+    /// cancelled and the error is propagated. Returns `Vec<T>` on
+    /// success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] if any child fails or on infrastructure
+    /// failures.
     ///
     /// # Examples
     ///
@@ -1236,6 +1486,7 @@ impl<I> FanOutBuilder<'_, I> {
     /// # use memable::{Context, EngineError};
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
     /// let results: Vec<String> = ctx.fan_out("shout:v1", vec!["hello".into()])
+    ///     .fail_fast()
     ///     .run(|child_ctx, item: String| async move {
     ///         let upper: String = child_ctx.step("upper:v1")
     ///             .run(async move || Ok(item.to_uppercase()))
@@ -1256,52 +1507,43 @@ impl<I> FanOutBuilder<'_, I> {
 
         let fan_out_step_key = format!("_fanout:{}", self.key);
 
-        // Check for cached result (replay path).
         if let Some(cached) = fan_out::check_cached::<T>(self.ctx, &fan_out_step_key)? {
             return Ok(cached);
         }
 
-        // No longer replaying.
         self.ctx
             .replaying
             .store(false, std::sync::atomic::Ordering::Release);
 
-        let child_ids: Vec<String> = (0..self.items.len())
-            .map(|idx| format!("{}/{}-{idx}", self.ctx.instance_id, self.key))
-            .collect();
-
-        let concurrency = self.concurrency.unwrap_or(self.items.len().max(1));
-
-        // Write manifest for crash recovery.
+        let child_ids = self.child_ids();
+        let concurrency = self.effective_concurrency();
         self.write_manifest(&fan_out_step_key, &child_ids)?;
 
         let closure = std::sync::Arc::new(f);
-        let results = fan_out::run_inline(
+        let tasks = fan_out::spawn_inline_tasks(
             &self.ctx.shared,
             &self.ctx.workflow_name,
             &child_ids,
             self.items,
-            closure,
+            &closure,
             concurrency,
-        )
-        .await?;
+        );
+        let results = fan_out::collect_fail_fast(tasks, child_ids.len()).await?;
 
-        // Persist the collected results for memoisation.
         fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
 
         Ok(results)
     }
 
-    /// Executes the fan-out using a registered workflow definition.
+    /// Executes the fan-out using a registered workflow (fail-fast mode).
     ///
-    /// Each item is serialized as the child workflow's input. The child's
-    /// output type is determined by the [`WorkflowDef`]. Results are
-    /// collected in item order.
+    /// On the first child failure, remaining children are cancelled.
+    /// Returns `Vec<O>` on success.
     ///
     /// # Errors
     ///
-    /// Returns the child's error if any child fails. Returns
-    /// [`EngineError::WorkflowNotFound`] if the workflow is not registered.
+    /// Returns [`EngineError`] if any child fails or if the workflow is
+    /// not registered.
     ///
     /// # Examples
     ///
@@ -1310,6 +1552,7 @@ impl<I> FanOutBuilder<'_, I> {
     /// # const PROCESS: WorkflowDef<String, String> = WorkflowDef::new("process");
     /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
     /// let results: Vec<String> = ctx.fan_out("batch:v1", vec!["a".into(), "b".into()])
+    ///     .fail_fast()
     ///     .workflow(&PROCESS)
     ///     .await?;
     /// # Ok(())
@@ -1333,16 +1576,10 @@ impl<I> FanOutBuilder<'_, I> {
             .store(false, std::sync::atomic::Ordering::Release);
 
         let child_workflow_name = def.name().to_string();
-
-        let child_ids: Vec<String> = (0..self.items.len())
-            .map(|idx| format!("{}/{}-{idx}", self.ctx.instance_id, self.key))
-            .collect();
-
-        let concurrency = self.concurrency.unwrap_or(self.items.len().max(1));
-
+        let child_ids = self.child_ids();
+        let concurrency = self.effective_concurrency();
         self.write_manifest(&fan_out_step_key, &child_ids)?;
 
-        // Serialize each item as input bytes.
         let mut items_bytes = Vec::with_capacity(self.items.len());
         for item in self.items {
             let data = StepData::Completed {
@@ -1353,39 +1590,17 @@ impl<I> FanOutBuilder<'_, I> {
             items_bytes.push(bytes);
         }
 
-        let results = fan_out::run_workflow::<O>(
+        let tasks = fan_out::spawn_workflow_tasks::<O>(
             &self.ctx.shared,
             &child_workflow_name,
             &child_ids,
             items_bytes,
             concurrency,
-        )
-        .await?;
+        );
+        let results = fan_out::collect_fail_fast(tasks, child_ids.len()).await?;
 
         fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
 
         Ok(results)
-    }
-
-    fn write_manifest(
-        &self,
-        fan_out_step_key: &str,
-        child_ids: &[String],
-    ) -> Result<(), EngineError> {
-        let manifest_step_key = fan_out_step_key.replace("_fanout:", "_fanout_manifest:");
-        let manifest = crate::engine::fan_out::FanOutManifest {
-            child_instance_ids: child_ids.to_vec(),
-            count: child_ids.len(),
-        };
-        let manifest_data = StepData::Completed {
-            result: manifest,
-            status: None,
-        };
-        let manifest_composite = format!(
-            "{}/{}/{}",
-            self.ctx.workflow_name, self.ctx.instance_id, manifest_step_key
-        );
-        let manifest_bytes = serialize_step(&manifest_data, &manifest_step_key)?;
-        self.ctx.write_step(&manifest_composite, &manifest_bytes)
     }
 }

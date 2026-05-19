@@ -362,6 +362,79 @@ pub enum StateError {
     Storage(Box<dyn std::error::Error + Send + Sync>),
 }
 
+/// A child workflow failure within a fan-out operation.
+///
+/// Returned in collect-all mode as part of `Vec<Result<T, ChildError>>`.
+/// Uses `String` for the error message (not `Box<dyn Error>`) so the
+/// result can be serialized and cached in the step table.
+///
+/// # Examples
+///
+/// ```
+/// use memable::ChildError;
+///
+/// let err = ChildError::new("batch-42/process:v1-0", "connection reset");
+/// assert!(err.to_string().contains("batch-42/process:v1-0"));
+/// assert_eq!(err.instance_id(), "batch-42/process:v1-0");
+/// assert_eq!(err.message(), "connection reset");
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, thiserror::Error)]
+#[error("child '{instance_id}' failed: {message}")]
+pub struct ChildError {
+    instance_id: String,
+    message: String,
+}
+
+impl ChildError {
+    /// Creates a new `ChildError`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::ChildError;
+    ///
+    /// let err = ChildError::new("child-1", "oops");
+    /// assert_eq!(err.instance_id(), "child-1");
+    /// ```
+    #[must_use]
+    pub fn new(instance_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Returns the child workflow's instance ID.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::ChildError;
+    ///
+    /// let err = ChildError::new("batch-42/work:v1-3", "timeout");
+    /// assert_eq!(err.instance_id(), "batch-42/work:v1-3");
+    /// ```
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Returns the error message from the failed child.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use memable::ChildError;
+    ///
+    /// let err = ChildError::new("child-1", "connection refused");
+    /// assert_eq!(err.message(), "connection refused");
+    /// ```
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
 /// Error returned by step closures.
 ///
 /// The variant communicates retry intent to the engine:
