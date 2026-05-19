@@ -1,23 +1,19 @@
-use std::collections::HashMap;
 use std::hash::{BuildHasher as _, RandomState};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::{Database, ReadableDatabase as _, ReadableTable as _};
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 use tracing::Instrument as _;
 use tracing::{error, info, info_span};
 
-use super::{Senders, WorkflowFn, WorkflowState};
+use super::{EngineShared, WorkflowFn, WorkflowState};
 use crate::context::{
     Context, STEPS, StepData, StepEnvelope, StepState, TIMERS, TimerEntry, deserialize_envelope,
     serialize_step,
 };
 use crate::error::EngineError;
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
-use crate::retry::RetryPolicy;
 
 pub(super) fn validate_key_component(value: &str, label: &'static str) -> Result<(), EngineError> {
     if value.contains('/') {
@@ -102,33 +98,26 @@ pub(super) fn handle_workflow_result(
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(super) fn spawn_workflow_task(
-    tasks: &mut JoinSet<()>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    shared: &Arc<EngineShared>,
     workflow: &WorkflowFn,
-    db: &Arc<Database>,
     workflow_name: &str,
     instance_id: &str,
-    timer_serial: &Arc<AtomicU64>,
-    default_retry: Option<RetryPolicy>,
     tx: &watch::Sender<WorkflowState>,
-    senders: &Senders,
 ) {
     let workflow = Arc::clone(workflow);
-    let db = Arc::clone(db);
+    let shared = Arc::clone(shared);
     let ctx = Context::new(
         workflow_name.to_string(),
         instance_id.to_string(),
-        Arc::clone(&db),
+        Arc::clone(&shared),
         tx.clone(),
-        Arc::clone(timer_serial),
-        default_retry,
     );
 
     let wf_name = workflow_name.to_string();
     let inst_id = instance_id.to_string();
     let tx = tx.clone();
-    let senders = Arc::clone(senders);
     let span = info_span!("workflow", name = %wf_name, instance = %inst_id);
 
     tasks.spawn(
@@ -136,9 +125,10 @@ pub(super) fn spawn_workflow_task(
             info!("executing");
             let result = workflow(ctx).await;
             let terminal = !matches!(&result, Err(EngineError::Suspended { .. }));
-            handle_workflow_result(result, &db, &wf_name, &inst_id, &tx);
+            handle_workflow_result(result, &shared.db, &wf_name, &inst_id, &tx);
             if terminal {
-                senders
+                shared
+                    .senders
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&inst_id);
@@ -219,27 +209,19 @@ pub(super) fn claim_suspended_step(
     Ok(())
 }
 
-pub(super) async fn poll_timers(
-    db: &Arc<Database>,
-    workflows: &HashMap<String, WorkflowFn>,
-    timer_serial: &Arc<AtomicU64>,
-    tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
-    default_retry: Option<&RetryPolicy>,
-    senders: &Senders,
-) -> Result<(), EngineError> {
+pub(super) async fn poll_timers(shared: &Arc<EngineShared>) -> Result<(), EngineError> {
     let now = now_unix_millis();
-    let expired = collect_expired_timers(db, now)?;
+    let expired = collect_expired_timers(&shared.db, now)?;
 
     for (key, entry) in expired {
-        let write_txn = db.begin_write()?;
+        let write_txn = shared.db.begin_write()?;
         {
             let mut table = write_txn.open_table(TIMERS)?;
             table.remove(key)?;
         }
         write_txn.commit()?;
 
-        // Fast-path: skip if workflow is clearly not suspended.
-        let meta = metadata::read_metadata(db, &entry.workflow_name, &entry.instance_id)?;
+        let meta = metadata::read_metadata(&shared.db, &entry.workflow_name, &entry.instance_id)?;
         let is_suspended = meta
             .as_ref()
             .is_some_and(|m| matches!(m.status(), MetadataStatus::Suspended { .. }));
@@ -260,17 +242,7 @@ pub(super) async fn poll_timers(
             "timer expired — signalling"
         );
 
-        match signal_timer(
-            db,
-            workflows,
-            timer_serial,
-            tasks,
-            &entry,
-            default_retry,
-            senders,
-        )
-        .await
-        {
+        match signal_timer(shared, &entry).await {
             Ok(()) => {}
             Err(EngineError::SignalSuperseded { ref key }) => {
                 info!(
@@ -314,15 +286,7 @@ fn collect_expired_timers(
     Ok(expired)
 }
 
-async fn signal_timer(
-    db: &Arc<Database>,
-    workflows: &HashMap<String, WorkflowFn>,
-    timer_serial: &Arc<AtomicU64>,
-    tasks: &Arc<tokio::sync::Mutex<JoinSet<()>>>,
-    entry: &TimerEntry,
-    default_retry: Option<&RetryPolicy>,
-    senders: &Senders,
-) -> Result<(), EngineError> {
+async fn signal_timer(shared: &Arc<EngineShared>, entry: &TimerEntry) -> Result<(), EngineError> {
     let data: StepData<()> = StepData::Completed {
         result: (),
         status: None,
@@ -330,19 +294,21 @@ async fn signal_timer(
     let step_bytes = serialize_step(&data, &entry.step_key)?;
 
     claim_suspended_step(
-        db,
+        &shared.db,
         &entry.workflow_name,
         &entry.instance_id,
         &entry.step_key,
         &step_bytes,
     )?;
 
-    let workflow = workflows
+    let workflow = shared
+        .workflows
         .get(&entry.workflow_name)
         .ok_or_else(|| EngineError::WorkflowNotFound(entry.workflow_name.clone()))?;
 
     let tx = {
-        let mut map = senders
+        let mut map = shared
+            .senders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(tx) = map.get(&entry.instance_id) {
@@ -358,17 +324,14 @@ async fn signal_timer(
         }
     };
 
-    let mut tasks = tasks.lock().await;
+    let mut tasks = shared.tasks.lock().await;
     spawn_workflow_task(
         &mut tasks,
+        shared,
         workflow,
-        db,
         &entry.workflow_name,
         &entry.instance_id,
-        timer_serial,
-        default_retry.cloned(),
         &tx,
-        senders,
     );
 
     Ok(())

@@ -11,6 +11,7 @@ use crate::metadata::{self, MetadataStatus, WorkflowMetadata};
 use redb::ReadableDatabase as _;
 
 use super::retention::cleanup_expired;
+use super::workflow::read_output;
 
 const WF: WorkflowDef = WorkflowDef::new("wf");
 
@@ -1288,20 +1289,21 @@ fn step_rejects_slash_in_key() {
     use redb::Database;
     use redb::backends::InMemoryBackend;
 
-    let db = Arc::new(
-        Database::builder()
-            .create_with_backend(InMemoryBackend::new())
-            .unwrap(),
-    );
+    let shared = Arc::new(super::EngineShared {
+        db: Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        ),
+        workflows: HashMap::new(),
+        running: Arc::new(AtomicBool::new(false)),
+        tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+        timer_serial: Arc::new(AtomicU64::new(0)),
+        default_retry: None,
+        senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
+    });
     let (tx, _rx) = watch::channel(WorkflowState::Started);
-    let ctx = Context::new(
-        "wf".into(),
-        "id".into(),
-        db,
-        tx,
-        Arc::new(AtomicU64::new(0)),
-        None,
-    );
+    let ctx = Context::new("wf".into(), "id".into(), shared, tx);
     let _ = ctx.step("bad/key");
 }
 
@@ -1332,20 +1334,21 @@ fn step_rejects_reserved_prefix() {
     use redb::Database;
     use redb::backends::InMemoryBackend;
 
-    let db = Arc::new(
-        Database::builder()
-            .create_with_backend(InMemoryBackend::new())
-            .unwrap(),
-    );
+    let shared = Arc::new(super::EngineShared {
+        db: Arc::new(
+            Database::builder()
+                .create_with_backend(InMemoryBackend::new())
+                .unwrap(),
+        ),
+        workflows: HashMap::new(),
+        running: Arc::new(AtomicBool::new(false)),
+        tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
+        timer_serial: Arc::new(AtomicU64::new(0)),
+        default_retry: None,
+        senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
+    });
     let (tx, _rx) = watch::channel(WorkflowState::Started);
-    let ctx = Context::new(
-        "wf".into(),
-        "id".into(),
-        db,
-        tx,
-        Arc::new(AtomicU64::new(0)),
-        None,
-    );
+    let ctx = Context::new("wf".into(), "id".into(), shared, tx);
     let _ = ctx.step("_reserved");
 }
 
@@ -2595,7 +2598,7 @@ async fn state_returns_started_for_stale_running() {
     engine.start().await.unwrap();
 
     metadata::write_metadata(
-        &engine.db,
+        &engine.shared.db,
         "wf",
         "stale-1",
         &WorkflowMetadata::new(MetadataStatus::Running),
@@ -2720,7 +2723,7 @@ async fn stop_with_no_running_workflows() {
     engine.stop().await;
 
     assert!(
-        !engine.running.load(Ordering::Acquire),
+        !engine.shared.running.load(Ordering::Acquire),
         "engine should be stopped"
     );
 }
@@ -2839,7 +2842,7 @@ async fn retention_cleans_expired_completed_workflows() {
     assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 
     // Verify steps exist.
-    let read_txn = engine.db.begin_read().unwrap();
+    let read_txn = engine.shared.db.begin_read().unwrap();
     let steps_table = read_txn.open_table(STEPS).unwrap();
     let step_key = format!("wf/{id}/s1");
     assert!(steps_table.get(step_key.as_str()).unwrap().is_some());
@@ -2850,14 +2853,15 @@ async fn retention_cleans_expired_completed_workflows() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Run cleanup directly.
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 1);
 
     // Metadata gone.
     assert!(engine.get_metadata(&WF, &id).unwrap().is_none());
 
     // Steps gone.
-    let read_txn = engine.db.begin_read().unwrap();
+    let read_txn = engine.shared.db.begin_read().unwrap();
     let steps_table = read_txn.open_table(STEPS).unwrap();
     assert!(steps_table.get(step_key.as_str()).unwrap().is_none());
 }
@@ -2881,7 +2885,8 @@ async fn retention_cleans_expired_failed_workflows() {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 1);
     assert!(engine.get_metadata(&WF, &id).unwrap().is_none());
 }
@@ -2907,7 +2912,8 @@ async fn retention_does_not_touch_running_workflows() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Cleanup should find nothing to clean.
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
     assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 
@@ -2937,7 +2943,8 @@ async fn retention_does_not_touch_suspended_workflows() {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
     assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 }
@@ -2975,7 +2982,7 @@ async fn retention_per_workflow_override() {
     let mut overrides = HashMap::new();
     overrides.insert("short-lived".to_string(), Duration::from_secs(1));
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(10), &overrides).unwrap();
+    let cleaned = cleanup_expired(&engine.shared.db, Duration::from_secs(10), &overrides).unwrap();
     assert_eq!(cleaned, 1);
 
     // short-lived is gone, long-lived remains.
@@ -3011,7 +3018,8 @@ async fn retention_no_op_when_nothing_expired() {
     let id = inv.instance_id().to_string();
     inv.wait().await;
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(100), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(100), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 0);
     assert!(engine.get_metadata(&WF, &id).unwrap().is_some());
 }
@@ -3039,7 +3047,8 @@ async fn retention_cleans_multiple_instances() {
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 3);
 
     let instances = engine.list_instances(&WF).unwrap();
@@ -3071,7 +3080,8 @@ async fn retention_concurrent_invoke_and_cleanup() {
     let new_inv = engine.invoke(&WF).await.unwrap();
     let new_id = new_inv.instance_id().to_string();
 
-    let cleaned = cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    let cleaned =
+        cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
     assert_eq!(cleaned, 1);
 
     new_inv.wait().await;
@@ -3102,7 +3112,7 @@ async fn retention_cleanup_removes_all_step_entries() {
     inv.wait().await;
 
     // Verify all step entries exist (3 steps + 1 _output).
-    let read_txn = engine.db.begin_read().unwrap();
+    let read_txn = engine.shared.db.begin_read().unwrap();
     let steps_table = read_txn.open_table(STEPS).unwrap();
     let prefix = format!("wf/{id}/");
     let end = format!("wf/{id}0");
@@ -3115,14 +3125,314 @@ async fn retention_cleanup_removes_all_step_entries() {
     drop(read_txn);
 
     tokio::time::sleep(Duration::from_secs(2)).await;
-    cleanup_expired(&engine.db, Duration::from_secs(1), &HashMap::new()).unwrap();
+    cleanup_expired(&engine.shared.db, Duration::from_secs(1), &HashMap::new()).unwrap();
 
     // All steps gone.
-    let read_txn = engine.db.begin_read().unwrap();
+    let read_txn = engine.shared.db.begin_read().unwrap();
     let steps_table = read_txn.open_table(STEPS).unwrap();
     let count = steps_table
         .range(prefix.as_str()..end.as_str())
         .unwrap()
         .count();
     assert_eq!(count, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Child workflow spawning
+// ---------------------------------------------------------------------------
+
+const CHILD_WF: WorkflowDef<String, String> = WorkflowDef::new("child-wf");
+
+async fn child_workflow(_ctx: Context, input: String) -> Result<String, EngineError> {
+    Ok(format!("processed:{input}"))
+}
+
+#[tokio::test]
+async fn child_step_key_isolation() {
+    const PARENT: WorkflowDef = WorkflowDef::new("parent");
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, |ctx: Context| async move {
+        let parent_val: String = ctx
+            .step("work:v1")
+            .run(async || Ok("parent-result".to_string()))
+            .await?;
+        assert_eq!(parent_val, "parent-result");
+
+        let input_data = crate::context::StepData::Completed {
+            result: "child-input".to_string(),
+            status: None,
+        };
+        let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+        let (child_id, mut rx) = ctx
+            .spawn_child("child-wf", "child-0", Some(input_bytes))
+            .await?;
+        assert!(child_id.contains("/child-0"));
+
+        loop {
+            let state = rx.borrow().clone();
+            if state.is_terminal() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let child_output: String = read_output(ctx.db(), "child-wf", &child_id)?;
+        assert_eq!(child_output, "processed:child-input");
+        Ok(())
+    });
+    engine.register(&CHILD_WF, child_workflow);
+    engine.start().await.unwrap();
+
+    let _ = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+}
+
+#[tokio::test]
+async fn child_output_readable_via_helper() {
+    let mut engine = test_engine();
+    engine.register(&CHILD_WF, child_workflow);
+    engine.start().await.unwrap();
+
+    let child_instance_id = "test-parent/child-key-0".to_string();
+    let input_data = crate::context::StepData::Completed {
+        result: "hello".to_string(),
+        status: None,
+    };
+    let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+
+    let inv = Engine::spawn_workflow::<String>(
+        &engine.shared,
+        "child-wf",
+        child_instance_id.clone(),
+        Some(input_bytes),
+    )
+    .await
+    .unwrap();
+
+    let _ = inv.wait().await.unwrap_completed();
+
+    let output: String = read_output(&engine.shared.db, "child-wf", &child_instance_id).unwrap();
+    assert_eq!(output, "processed:hello");
+}
+
+#[tokio::test]
+async fn child_metadata_written() {
+    let mut engine = test_engine();
+    engine.register(&CHILD_WF, child_workflow);
+    engine.start().await.unwrap();
+
+    let child_instance_id = "parent-1/child-0".to_string();
+    let input_data = crate::context::StepData::Completed {
+        result: "data".to_string(),
+        status: None,
+    };
+    let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+
+    let inv = Engine::spawn_workflow::<String>(
+        &engine.shared,
+        "child-wf",
+        child_instance_id.clone(),
+        Some(input_bytes),
+    )
+    .await
+    .unwrap();
+
+    let _ = inv.wait().await.unwrap_completed();
+
+    let meta = metadata::read_metadata(&engine.shared.db, "child-wf", &child_instance_id)
+        .unwrap()
+        .expect("child metadata should exist");
+    assert!(meta.status().is_terminal());
+    assert!(matches!(meta.status(), MetadataStatus::Completed(_)));
+}
+
+#[tokio::test]
+async fn child_appears_in_list_metadata() {
+    let mut engine = test_engine();
+    engine.register(&CHILD_WF, child_workflow);
+    engine.start().await.unwrap();
+
+    let input_data = crate::context::StepData::Completed {
+        result: "x".to_string(),
+        status: None,
+    };
+    let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+
+    let inv = Engine::spawn_workflow::<String>(
+        &engine.shared,
+        "child-wf",
+        "parent-1/child-0".to_string(),
+        Some(input_bytes.clone()),
+    )
+    .await
+    .unwrap();
+    let _ = inv.wait().await.unwrap_completed();
+
+    let inv2 = Engine::spawn_workflow::<String>(
+        &engine.shared,
+        "child-wf",
+        "top-level-instance".to_string(),
+        Some(input_bytes),
+    )
+    .await
+    .unwrap();
+    let _ = inv2.wait().await.unwrap_completed();
+
+    let all = metadata::list_metadata(&engine.shared.db, "child-wf").unwrap();
+    assert_eq!(all.len(), 2);
+
+    let child_ids: Vec<&str> = all.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(child_ids.contains(&"parent-1/child-0"));
+    assert!(child_ids.contains(&"top-level-instance"));
+}
+
+#[tokio::test]
+async fn child_input_output_round_trip() {
+    const ECHO: WorkflowDef<i32, i32> = WorkflowDef::new("echo");
+
+    async fn echo(_ctx: Context, val: i32) -> Result<i32, EngineError> {
+        Ok(val * 10)
+    }
+
+    let mut engine = test_engine();
+    engine.register(&ECHO, echo);
+    engine.start().await.unwrap();
+
+    let input_data = crate::context::StepData::Completed {
+        result: 42_i32,
+        status: None,
+    };
+    let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+
+    let inv = Engine::spawn_workflow::<i32>(
+        &engine.shared,
+        "echo",
+        "parent-99/echo-child-0".to_string(),
+        Some(input_bytes),
+    )
+    .await
+    .unwrap();
+
+    let _ = inv.wait().await.unwrap_completed();
+
+    let output: i32 = read_output(&engine.shared.db, "echo", "parent-99/echo-child-0").unwrap();
+    assert_eq!(output, 420);
+}
+
+#[tokio::test]
+async fn nested_child_key_isolation() {
+    const LEVEL1: WorkflowDef<(), String> = WorkflowDef::new("level1");
+    const LEVEL2: WorkflowDef<(), String> = WorkflowDef::new("level2");
+
+    let mut engine = test_engine();
+
+    engine.register(&LEVEL2, |ctx: Context| async move {
+        let val: String = ctx
+            .step("work:v1")
+            .run(async || Ok("leaf-result".to_string()))
+            .await?;
+        Ok(val)
+    });
+
+    engine.register(&LEVEL1, |ctx: Context| async move {
+        let val: String = ctx
+            .step("work:v1")
+            .run(async || Ok("mid-result".to_string()))
+            .await?;
+
+        let (grandchild_id, mut rx) = ctx.spawn_child("level2", "grandchild-0", None).await?;
+
+        loop {
+            let state = rx.borrow().clone();
+            if state.is_terminal() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let grandchild_output: String = read_output(ctx.db(), "level2", &grandchild_id)?;
+        assert_eq!(grandchild_output, "leaf-result");
+        assert_eq!(val, "mid-result");
+        Ok(val)
+    });
+
+    engine.start().await.unwrap();
+
+    // Spawn level1 as a child of a fake parent
+    let inv = Engine::spawn_workflow::<String>(
+        &engine.shared,
+        "level1",
+        "root/level1-child-0".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let _ = inv.wait().await.unwrap_completed();
+
+    let output: String = read_output(&engine.shared.db, "level1", "root/level1-child-0").unwrap();
+    assert_eq!(output, "mid-result");
+
+    // Verify step keys are fully isolated despite both workflows using "work:v1"
+    let read_txn = engine.shared.db.begin_read().unwrap();
+    let steps_table = read_txn.open_table(STEPS).unwrap();
+
+    let level1_step = "level1/root/level1-child-0/work:v1";
+    assert!(steps_table.get(level1_step).unwrap().is_some());
+
+    let level2_step = "level2/root/level1-child-0/grandchild-0/work:v1";
+    assert!(steps_table.get(level2_step).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn spawn_child_from_context() {
+    const PARENT: WorkflowDef = WorkflowDef::new("ctx-parent");
+
+    let mut engine = test_engine();
+    engine.register(&CHILD_WF, child_workflow);
+    engine.register(&PARENT, |ctx: Context| async move {
+        let input_data = crate::context::StepData::Completed {
+            result: "from-parent".to_string(),
+            status: None,
+        };
+        let input_bytes = crate::context::serialize_step(&input_data, "_input").unwrap();
+        let (child_id, mut rx) = ctx
+            .spawn_child("child-wf", "my-child-0", Some(input_bytes))
+            .await?;
+
+        assert!(child_id.ends_with("/my-child-0"));
+
+        loop {
+            let state = rx.borrow().clone();
+            if state.is_terminal() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+
+        let output: String = read_output(ctx.db(), "child-wf", &child_id)?;
+        assert_eq!(output, "processed:from-parent");
+        Ok(())
+    });
+    engine.start().await.unwrap();
+
+    let _ = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
 }

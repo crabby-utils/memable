@@ -4,8 +4,10 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use redb::{Database, ReadableDatabase as _};
+
 use super::WorkflowFn;
-use crate::context::{Context, StepData, serialize_step};
+use crate::context::{Context, STEPS, StepData, deserialize_step, serialize_step};
 use crate::error::EngineError;
 
 /// Marker for workflows that take no input.
@@ -99,5 +101,38 @@ where
                 Ok(())
             })
         })
+    }
+}
+
+pub(crate) fn read_output<T: DeserializeOwned>(
+    db: &Database,
+    workflow_name: &str,
+    instance_id: &str,
+) -> Result<T, EngineError> {
+    let composite_key = format!("{workflow_name}/{instance_id}/_output");
+    let read_txn = db.begin_read()?;
+    let table = match read_txn.open_table(STEPS) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(EngineError::OutputMissing {
+                workflow: workflow_name.to_string(),
+                instance_id: instance_id.to_string(),
+            });
+        }
+        Err(e) => return Err(EngineError::from(e)),
+    };
+    let bytes = table
+        .get(composite_key.as_str())?
+        .ok_or_else(|| EngineError::OutputMissing {
+            workflow: workflow_name.to_string(),
+            instance_id: instance_id.to_string(),
+        })?;
+    let data: StepData<T> = deserialize_step(bytes.value(), "_output")?;
+    match data {
+        StepData::Completed { result, .. } => Ok(result),
+        StepData::Suspended | StepData::Failed { .. } => Err(EngineError::OutputMissing {
+            workflow: workflow_name.to_string(),
+            instance_id: instance_id.to_string(),
+        }),
     }
 }

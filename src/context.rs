@@ -3,16 +3,16 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use redb::{Database, ReadableDatabase as _, TableDefinition};
+use redb::{ReadableDatabase as _, TableDefinition};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tracing::{info, info_span};
 
-use crate::engine::WorkflowState;
+use crate::engine::{EngineShared, WorkflowState};
 use crate::error::{EngineError, StepError};
 use crate::retry::RetryPolicy;
 
@@ -282,30 +282,24 @@ pub(crate) fn deserialize_envelope(bytes: &[u8], key: &str) -> Result<StepEnvelo
 pub struct Context {
     workflow_name: String,
     instance_id: String,
-    db: Arc<Database>,
+    shared: Arc<EngineShared>,
     status_tx: watch::Sender<WorkflowState>,
     replaying: AtomicBool,
-    timer_serial: Arc<AtomicU64>,
-    default_retry: Option<RetryPolicy>,
 }
 
 impl Context {
     pub(crate) fn new(
         workflow_name: String,
         instance_id: String,
-        db: Arc<Database>,
+        shared: Arc<EngineShared>,
         status_tx: watch::Sender<WorkflowState>,
-        timer_serial: Arc<AtomicU64>,
-        default_retry: Option<RetryPolicy>,
     ) -> Self {
         Self {
             workflow_name,
             instance_id,
-            db,
+            shared,
             status_tx,
             replaying: AtomicBool::new(true),
-            timer_serial,
-            default_retry,
         }
     }
 
@@ -360,8 +354,8 @@ impl Context {
     }
 
     /// Returns a reference to the database handle.
-    pub(crate) fn db(&self) -> &Arc<Database> {
-        &self.db
+    pub(crate) fn db(&self) -> &Arc<redb::Database> {
+        &self.shared.db
     }
 
     /// Reads the typed input payload provided at invocation time.
@@ -610,7 +604,7 @@ impl Context {
         let data = StepData::<()>::Suspended;
         let step_bytes = serialize_step(&data, key)?;
 
-        let serial = self.timer_serial.fetch_add(1, Ordering::Relaxed);
+        let serial = self.shared.timer_serial.fetch_add(1, Ordering::Relaxed);
         let entry = TimerEntry {
             workflow_name: self.workflow_name.clone(),
             instance_id: self.instance_id.clone(),
@@ -622,7 +616,7 @@ impl Context {
                 source: Box::new(e),
             })?;
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.shared.db.begin_write()?;
         {
             let mut steps = write_txn.open_table(STEPS)?;
             steps.insert(composite_key.as_str(), step_bytes.as_slice())?;
@@ -706,9 +700,30 @@ impl Context {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "plumbing for fan_out in Phase 4")
+    )]
+    pub(crate) async fn spawn_child(
+        &self,
+        workflow_name: &str,
+        child_key: &str,
+        input_bytes: Option<Vec<u8>>,
+    ) -> Result<(String, tokio::sync::watch::Receiver<WorkflowState>), EngineError> {
+        let child_instance_id = format!("{}/{child_key}", self.instance_id);
+        let invocation = crate::engine::Engine::spawn_workflow::<()>(
+            &self.shared,
+            workflow_name,
+            child_instance_id,
+            input_bytes,
+        )
+        .await?;
+        Ok(invocation.into_parts())
+    }
+
     /// Reads a step result from redb. Returns `None` on cache miss.
     fn read_step(&self, composite_key: &str) -> Result<Option<Vec<u8>>, EngineError> {
-        let read_txn = self.db.begin_read()?;
+        let read_txn = self.shared.db.begin_read()?;
         let table = match read_txn.open_table(STEPS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -722,7 +737,7 @@ impl Context {
 
     /// Writes a step result to redb.
     fn write_step(&self, composite_key: &str, value: &[u8]) -> Result<(), EngineError> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.shared.db.begin_write()?;
         {
             let mut table = write_txn.open_table(STEPS)?;
             table.insert(composite_key, value)?;
@@ -918,7 +933,7 @@ impl StepBuilder<'_> {
         match &self.retry_override {
             Some(RetryOverride::Disabled) => None,
             Some(RetryOverride::Custom(policy)) => Some(policy),
-            None => self.ctx.default_retry.as_ref(),
+            None => self.ctx.shared.default_retry.as_ref(),
         }
     }
 

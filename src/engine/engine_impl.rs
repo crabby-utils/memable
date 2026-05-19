@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use redb::Database;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
-use tokio::task::JoinSet;
 use tracing::Instrument as _;
 use tracing::{error, info, info_span, warn};
 
@@ -18,11 +16,10 @@ use super::execution::{
 };
 use super::invocation::{Invocation, InvocationBuilder};
 use super::retention::cleanup_expired;
-use super::{Senders, WorkflowFn, WorkflowState};
+use super::{EngineShared, WorkflowState};
 use crate::context::{STEPS, StepData, SuspendPoint, WorkflowDef, serialize_step};
 use crate::error::{EngineError, StateError, SubscribeError};
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
-use crate::retry::RetryPolicy;
 use crate::stream::StatusStream;
 
 /// The durable execution engine.
@@ -67,17 +64,11 @@ use crate::stream::StatusStream;
 /// # }
 /// ```
 pub struct Engine {
-    pub(super) db: Arc<Database>,
-    pub(super) workflows: HashMap<String, WorkflowFn>,
-    pub(super) running: Arc<AtomicBool>,
-    pub(super) tasks: Arc<tokio::sync::Mutex<JoinSet<()>>>,
-    pub(super) timer_serial: Arc<AtomicU64>,
-    pub(super) default_retry: Option<RetryPolicy>,
+    pub(super) shared: Arc<EngineShared>,
     pub(super) resume_on_start: bool,
     pub(super) shutdown_timeout: Duration,
     pub(super) retention: Option<Duration>,
     pub(super) workflow_retentions: HashMap<String, Duration>,
-    pub(super) senders: Senders,
 }
 
 impl Engine {
@@ -135,12 +126,15 @@ impl Engine {
         W: super::workflow::IntoWorkflow<I, O, M>,
     {
         assert!(
-            !self.running.load(Ordering::Acquire),
+            !self.shared.running.load(Ordering::Acquire),
             "cannot register workflows after the engine has started"
         );
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("cannot register workflows after engine handles are shared");
         let name = def.name().to_string();
         info!(%name, "registered workflow");
-        self.workflows
+        shared
+            .workflows
             .insert(name.clone(), workflow.into_workflow_fn());
         Registration { engine: self, name }
     }
@@ -166,34 +160,19 @@ impl Engine {
     /// Panics if the engine has already been started.
     pub async fn start(&mut self) -> Result<(), EngineError> {
         assert!(
-            !self.running.load(Ordering::Acquire),
+            !self.shared.running.load(Ordering::Acquire),
             "engine has already been started"
         );
-        self.running.store(true, Ordering::Release);
+        self.shared.running.store(true, Ordering::Release);
 
-        let db = Arc::clone(&self.db);
-        let running = Arc::clone(&self.running);
-        let workflows = self.workflows.clone();
-        let timer_serial = Arc::clone(&self.timer_serial);
-        let poller_tasks = Arc::clone(&self.tasks);
-        let default_retry = self.default_retry.clone();
-        let poller_senders = Arc::clone(&self.senders);
-        let mut tasks = self.tasks.lock().await;
+        let poller_shared = Arc::clone(&self.shared);
+        let mut tasks = self.shared.tasks.lock().await;
         tasks.spawn(
             async move {
                 info!("timer poller started");
-                while running.load(Ordering::Acquire) {
+                while poller_shared.running.load(Ordering::Acquire) {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Err(e) = poll_timers(
-                        &db,
-                        &workflows,
-                        &timer_serial,
-                        &poller_tasks,
-                        default_retry.as_ref(),
-                        &poller_senders,
-                    )
-                    .await
-                    {
+                    if let Err(e) = poll_timers(&poller_shared).await {
                         error!(error = %e, "timer poll failed");
                     }
                 }
@@ -203,8 +182,8 @@ impl Engine {
         );
 
         if let Some(retention) = self.retention {
-            let db = Arc::clone(&self.db);
-            let running = Arc::clone(&self.running);
+            let db = Arc::clone(&self.shared.db);
+            let running = Arc::clone(&self.shared.running);
             let workflow_retentions = self.workflow_retentions.clone();
             tasks.spawn(
                 async move {
@@ -240,9 +219,9 @@ impl Engine {
     }
 
     async fn resume_running_instances(&self) -> Result<(), EngineError> {
-        let workflow_names: Vec<String> = self.workflows.keys().cloned().collect();
+        let workflow_names: Vec<String> = self.shared.workflows.keys().cloned().collect();
         for workflow_name in &workflow_names {
-            let instances = metadata::list_metadata(&self.db, workflow_name)?;
+            let instances = metadata::list_metadata(&self.shared.db, workflow_name)?;
             for (instance_id, meta) in instances {
                 if *meta.status() == MetadataStatus::Running {
                     info!(
@@ -250,9 +229,13 @@ impl Engine {
                         instance_id = %instance_id,
                         "auto-resuming workflow instance"
                     );
-                    match self
-                        .spawn_workflow::<()>(workflow_name, instance_id.clone(), None)
-                        .await
+                    match Self::spawn_workflow::<()>(
+                        &self.shared,
+                        workflow_name,
+                        instance_id.clone(),
+                        None,
+                    )
+                    .await
                     {
                         Ok(_) => {}
                         Err(e) => {
@@ -355,7 +338,7 @@ impl Engine {
     ) -> Result<Invocation<O>, EngineError> {
         let instance_id = instance_id.into();
         validate_key_component(&instance_id, "instance_id")?;
-        self.spawn_workflow(def.name(), instance_id, None).await
+        Self::spawn_workflow(&self.shared, def.name(), instance_id, None).await
     }
 
     /// Delivers a signal payload to a suspended workflow step.
@@ -421,7 +404,13 @@ impl Engine {
         };
         let step_bytes = serialize_step(&data, step_key)?;
 
-        claim_suspended_step(&self.db, workflow_name, instance_id, step_key, &step_bytes)?;
+        claim_suspended_step(
+            &self.shared.db,
+            workflow_name,
+            instance_id,
+            step_key,
+            &step_bytes,
+        )?;
 
         info!(
             workflow = workflow_name,
@@ -430,36 +419,34 @@ impl Engine {
             "signal delivered"
         );
 
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.shared.tasks.lock().await;
 
-        if !self.running.load(Ordering::Acquire) {
+        if !self.shared.running.load(Ordering::Acquire) {
             return Err(EngineError::NotStarted);
         }
 
         let workflow = self
+            .shared
             .workflows
             .get(workflow_name)
             .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
 
-        let tx = self.get_or_create_sender(instance_id);
+        let tx = Self::get_or_create_sender(&self.shared.senders, instance_id);
         let rx = tx.subscribe();
 
         spawn_workflow_task(
             &mut tasks,
+            &self.shared,
             workflow,
-            &self.db,
             workflow_name,
             instance_id,
-            &self.timer_serial,
-            self.default_retry.clone(),
             &tx,
-            &self.senders,
         );
 
         Ok(Invocation {
             instance_id: instance_id.to_string(),
             status: rx,
-            db: Arc::clone(&self.db),
+            db: Arc::clone(&self.shared.db),
             workflow_name: workflow_name.to_string(),
             _marker: PhantomData,
         })
@@ -509,6 +496,7 @@ impl Engine {
     ) -> Result<StatusStream, SubscribeError> {
         let workflow_name = def.name();
         let senders = self
+            .shared
             .senders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -517,7 +505,7 @@ impl Engine {
         }
         drop(senders);
 
-        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id)
+        let meta = metadata::read_metadata(&self.shared.db, workflow_name, instance_id)
             .map_err(|e| SubscribeError::Storage(e.to_string().into()))?;
 
         match meta {
@@ -589,6 +577,7 @@ impl Engine {
     ) -> Result<WorkflowState, StateError> {
         let workflow_name = def.name();
         let senders = self
+            .shared
             .senders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -597,7 +586,7 @@ impl Engine {
         }
         drop(senders);
 
-        let meta = metadata::read_metadata(&self.db, workflow_name, instance_id)
+        let meta = metadata::read_metadata(&self.shared.db, workflow_name, instance_id)
             .map_err(|e| StateError::Storage(e.to_string().into()))?;
 
         match meta {
@@ -651,7 +640,7 @@ impl Engine {
         def: &WorkflowDef<I, O>,
         instance_id: &str,
     ) -> Result<Option<WorkflowMetadata>, EngineError> {
-        metadata::read_metadata(&self.db, def.name(), instance_id)
+        metadata::read_metadata(&self.shared.db, def.name(), instance_id)
     }
 
     /// Lists all instances of a workflow definition.
@@ -687,7 +676,7 @@ impl Engine {
         &self,
         def: &WorkflowDef<I, O>,
     ) -> Result<Vec<(String, WorkflowMetadata)>, EngineError> {
-        metadata::list_metadata(&self.db, def.name())
+        metadata::list_metadata(&self.shared.db, def.name())
     }
 
     /// Gracefully stops the engine.
@@ -723,13 +712,13 @@ impl Engine {
     /// # }
     /// ```
     pub async fn stop(&self) {
-        self.running.store(false, Ordering::Release);
+        self.shared.running.store(false, Ordering::Release);
         info!(
             timeout_secs = self.shutdown_timeout.as_secs_f64(),
             "engine stopping — waiting for running workflows"
         );
 
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.shared.tasks.lock().await;
         let drain_result = tokio::time::timeout(self.shutdown_timeout, async {
             while let Some(result) = tasks.join_next().await {
                 if let Err(e) = result {
@@ -788,9 +777,9 @@ impl Engine {
     /// # }
     /// ```
     pub async fn wait_all(&self) {
-        self.running.store(false, Ordering::Release);
+        self.shared.running.store(false, Ordering::Release);
         info!("waiting for all workflows to complete");
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.shared.tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
             if let Err(e) = result {
                 if e.is_panic() {
@@ -801,20 +790,20 @@ impl Engine {
         info!("all workflows completed");
     }
 
-    pub(super) async fn spawn_workflow<O>(
-        &self,
+    pub(crate) async fn spawn_workflow<O>(
+        shared: &Arc<EngineShared>,
         workflow_name: &str,
         instance_id: String,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<Invocation<O>, EngineError> {
         validate_key_component(workflow_name, "workflow_name")?;
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = shared.tasks.lock().await;
 
-        if !self.running.load(Ordering::Acquire) {
+        if !shared.running.load(Ordering::Acquire) {
             return Err(EngineError::NotStarted);
         }
 
-        let workflow = self
+        let workflow = shared
             .workflows
             .get(workflow_name)
             .ok_or_else(|| EngineError::WorkflowNotFound(workflow_name.to_string()))?;
@@ -826,7 +815,7 @@ impl Engine {
             source: Box::new(e),
         })?;
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = shared.db.begin_write()?;
         {
             let mut meta_table = write_txn.open_table(WORKFLOW_META)?;
             meta_table.insert(meta_key.as_str(), meta_bytes.as_slice())?;
@@ -839,33 +828,32 @@ impl Engine {
         }
         write_txn.commit()?;
 
-        let tx = self.get_or_create_sender(&instance_id);
+        let tx = Self::get_or_create_sender(&shared.senders, &instance_id);
         let rx = tx.subscribe();
 
         spawn_workflow_task(
             &mut tasks,
+            shared,
             workflow,
-            &self.db,
             workflow_name,
             &instance_id,
-            &self.timer_serial,
-            self.default_retry.clone(),
             &tx,
-            &self.senders,
         );
 
         Ok(Invocation {
             instance_id,
             status: rx,
-            db: Arc::clone(&self.db),
+            db: Arc::clone(&shared.db),
             workflow_name: workflow_name.to_string(),
             _marker: PhantomData,
         })
     }
 
-    fn get_or_create_sender(&self, instance_id: &str) -> watch::Sender<WorkflowState> {
-        let mut senders = self
-            .senders
+    fn get_or_create_sender(
+        senders: &super::Senders,
+        instance_id: &str,
+    ) -> watch::Sender<WorkflowState> {
+        let mut senders = senders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(tx) = senders.get(instance_id) {

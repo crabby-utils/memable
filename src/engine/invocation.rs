@@ -3,14 +3,15 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use redb::{Database, ReadableDatabase as _};
+use redb::Database;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 
 use super::WorkflowState;
 use super::execution::generate_instance_id;
-use crate::context::{STEPS, StepData, deserialize_step, serialize_step};
+use super::workflow::read_output;
+use crate::context::{StepData, serialize_step};
 use crate::error::EngineError;
 
 /// Handle for a running workflow instance.
@@ -438,33 +439,7 @@ impl<O: DeserializeOwned> Completed<O> {
     /// # }
     /// ```
     pub fn output(&self) -> Result<O, EngineError> {
-        let composite_key = format!("{}/{}/_output", self.workflow_name, self.instance_id);
-        let read_txn = self.db.begin_read()?;
-        let table = match read_txn.open_table(STEPS) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(EngineError::OutputMissing {
-                    workflow: self.workflow_name.clone(),
-                    instance_id: self.instance_id.clone(),
-                });
-            }
-            Err(e) => return Err(EngineError::from(e)),
-        };
-        let bytes =
-            table
-                .get(composite_key.as_str())?
-                .ok_or_else(|| EngineError::OutputMissing {
-                    workflow: self.workflow_name.clone(),
-                    instance_id: self.instance_id.clone(),
-                })?;
-        let data: StepData<O> = deserialize_step(bytes.value(), "_output")?;
-        match data {
-            StepData::Completed { result, .. } => Ok(result),
-            StepData::Suspended | StepData::Failed { .. } => Err(EngineError::OutputMissing {
-                workflow: self.workflow_name.clone(),
-                instance_id: self.instance_id.clone(),
-            }),
-        }
+        read_output(&self.db, &self.workflow_name, &self.instance_id)
     }
 }
 
@@ -560,9 +535,13 @@ impl<'a, O: Send + 'a> IntoFuture for InvocationBuilder<'a, (), O> {
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let input_bytes = self.input_payload?;
-            self.engine
-                .spawn_workflow(&self.workflow_name, generate_instance_id(), input_bytes)
-                .await
+            super::Engine::spawn_workflow(
+                &self.engine.shared,
+                &self.workflow_name,
+                generate_instance_id(),
+                input_bytes,
+            )
+            .await
         })
     }
 }

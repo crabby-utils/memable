@@ -8,6 +8,7 @@ use redb::Database;
 use redb::backends::InMemoryBackend;
 use tokio::task::JoinSet;
 
+use super::EngineShared;
 use crate::error::EngineError;
 use crate::retry::RetryPolicy;
 
@@ -325,18 +326,21 @@ impl EngineBuilder<HasStore> {
     /// [`open`](EngineBuilder::open).
     #[must_use]
     pub fn build(self) -> super::Engine {
-        super::Engine {
+        let shared = EngineShared {
             db: Arc::new(self.store.0),
             workflows: HashMap::new(),
             running: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
             timer_serial: Arc::new(AtomicU64::new(0)),
             default_retry: self.default_retry,
+            senders: Arc::new(Mutex::new(HashMap::new())),
+        };
+        super::Engine {
+            shared: Arc::new(shared),
             resume_on_start: self.resume_on_start,
             shutdown_timeout: resolve_shutdown_timeout(self.shutdown_timeout),
             retention: self.retention,
             workflow_retentions: HashMap::new(),
-            senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
