@@ -16,8 +16,9 @@ use crate::error::EngineError;
 
 /// Handle for a running workflow instance.
 ///
-/// Returned by [`Engine::invoke`](super::Engine::invoke) and
-/// [`Engine::resume`](super::Engine::resume). Provides the instance ID
+/// Returned by [`Engine::invoke`](super::Engine::invoke),
+/// [`Engine::resume`](super::Engine::resume), and
+/// [`Engine::signal`](super::Engine::signal). Provides the instance ID
 /// and a status channel for observing [`WorkflowState`] transitions.
 ///
 /// Call [`wait`](Invocation::wait) to consume the handle and obtain a
