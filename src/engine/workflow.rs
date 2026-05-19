@@ -31,7 +31,7 @@ pub trait IntoWorkflow<I, O, Marker>: Send + Sync + 'static {
     fn into_workflow_fn(self) -> WorkflowFn;
 }
 
-fn write_output<O: Serialize>(
+pub(crate) fn write_output<O: Serialize>(
     db: &redb::Database,
     workflow_name: &str,
     instance_id: &str,

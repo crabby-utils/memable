@@ -1,6 +1,7 @@
 mod builder;
 mod engine_impl;
 mod execution;
+pub(crate) mod fan_out;
 mod invocation;
 mod retention;
 mod state;

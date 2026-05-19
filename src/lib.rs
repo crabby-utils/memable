@@ -98,7 +98,7 @@ mod metadata;
 mod retry;
 mod stream;
 
-pub use context::{Context, StepBuilder, SuspendBuilder, SuspendPoint, WorkflowDef};
+pub use context::{Context, FanOutBuilder, StepBuilder, SuspendBuilder, SuspendPoint, WorkflowDef};
 pub use engine::{
     Completed, Engine, EngineBuilder, HasStore, IntoWorkflow, Invocation, InvocationBuilder,
     NoStore, Registration, WaitResult, WorkflowState,

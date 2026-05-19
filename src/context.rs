@@ -203,7 +203,7 @@ pub(crate) struct StepEnvelope {
     /// `Some(type_name)` for `Completed` entries, `None` otherwise.
     pub type_tag: Option<String>,
     /// Postcard-serialized `StepData<T>` bytes.
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 /// Serialize a [`StepData<T>`] into an envelope with a type tag.
@@ -700,10 +700,7 @@ impl Context {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "plumbing for fan_out in Phase 4")
-    )]
+    #[cfg_attr(not(test), expect(dead_code, reason = "used by tests and future API"))]
     pub(crate) async fn spawn_child(
         &self,
         workflow_name: &str,
@@ -719,6 +716,53 @@ impl Context {
         )
         .await?;
         Ok(invocation.into_parts())
+    }
+
+    /// Creates a fan-out builder that spawns child workflows for each item.
+    ///
+    /// Children execute concurrently (up to an optional limit set via
+    /// [`FanOutBuilder::concurrency`]) while the parent workflow suspends.
+    /// When all children complete, the parent resumes with the collected
+    /// results.
+    ///
+    /// Use [`.run(closure)`](FanOutBuilder::run) for inline closures or
+    /// [`.workflow(&DEF)`](FanOutBuilder::workflow) for registered workflows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` contains `/`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use memable::{Context, EngineError};
+    ///
+    /// async fn pipeline(ctx: Context) -> Result<(), EngineError> {
+    ///     let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    ///     let results: Vec<String> = ctx.fan_out("process:v1", items)
+    ///         .concurrency(2)
+    ///         .run(|child_ctx, item| async move {
+    ///             let upper: String = child_ctx.step("upper:v1")
+    ///                 .run(async move || Ok(item.to_uppercase()))
+    ///                 .await?;
+    ///             Ok(upper)
+    ///         }).await?;
+    ///     assert_eq!(results, vec!["A", "B", "C"]);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[must_use]
+    pub fn fan_out<'a, I>(&'a self, key: &'a str, items: Vec<I>) -> FanOutBuilder<'a, I> {
+        assert!(
+            !key.contains('/'),
+            "fan_out key must not contain '/': '{key}'"
+        );
+        FanOutBuilder {
+            ctx: self,
+            key,
+            items,
+            concurrency: None,
+        }
     }
 
     /// Reads a step result from redb. Returns `None` on cache miss.
@@ -1111,5 +1155,237 @@ impl StepBuilder<'_> {
         }
 
         unreachable!("loop should return before exhausting iterations")
+    }
+}
+
+/// Builder for a fan-out operation that spawns child workflows.
+///
+/// Created by [`Context::fan_out`]. Chain
+/// [`.concurrency(n)`](FanOutBuilder::concurrency) to limit parallelism,
+/// then call [`.run(closure)`](FanOutBuilder::run) for inline closures or
+/// [`.workflow(&DEF)`](FanOutBuilder::workflow) for registered workflows.
+///
+/// # Examples
+///
+/// ```no_run
+/// use memable::{Context, EngineError};
+///
+/// async fn pipeline(ctx: Context) -> Result<(), EngineError> {
+///     let items = vec![1, 2, 3];
+///     let results: Vec<i32> = ctx.fan_out("double:v1", items)
+///         .concurrency(2)
+///         .run(|child_ctx, item| async move {
+///             let doubled: i32 = child_ctx.step("calc:v1")
+///                 .run(async move || Ok(item * 2))
+///                 .await?;
+///             Ok(doubled)
+///         }).await?;
+///     assert_eq!(results, vec![2, 4, 6]);
+///     Ok(())
+/// }
+/// ```
+pub struct FanOutBuilder<'a, I> {
+    ctx: &'a Context,
+    key: &'a str,
+    items: Vec<I>,
+    concurrency: Option<usize>,
+}
+
+impl<I> FanOutBuilder<'_, I> {
+    /// Limits the number of children executing concurrently.
+    ///
+    /// If not set, all children run in parallel.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results: Vec<String> = ctx.fan_out("batch:v1", vec!["a".into(), "b".into()])
+    ///     .concurrency(1)
+    ///     .run(|child_ctx, item: String| async move { Ok(item) })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn concurrency(mut self, n: usize) -> Self {
+        self.concurrency = Some(n);
+        self
+    }
+
+    /// Executes the fan-out with an inline closure.
+    ///
+    /// Each item is paired with a fresh [`Context`] and passed to the
+    /// closure. The closure's return value is written as the child's
+    /// output. Results are collected in item order.
+    ///
+    /// The parent task stays alive while children execute concurrently.
+    /// If any child fails, remaining children are cancelled and the
+    /// error is propagated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the child's error if any child fails. Returns
+    /// [`EngineError::Storage`] or [`EngineError::Serialization`] on
+    /// persistence failures.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError};
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results: Vec<String> = ctx.fan_out("shout:v1", vec!["hello".into()])
+    ///     .run(|child_ctx, item: String| async move {
+    ///         let upper: String = child_ctx.step("upper:v1")
+    ///             .run(async move || Ok(item.to_uppercase()))
+    ///             .await?;
+    ///         Ok(upper)
+    ///     }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run<F, T, Fut>(self, f: F) -> Result<Vec<T>, EngineError>
+    where
+        F: Fn(Context, I) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<T, EngineError>> + Send + 'static,
+        I: Serialize + DeserializeOwned + Send + 'static,
+        T: Serialize + DeserializeOwned + Send + 'static,
+    {
+        use crate::engine::fan_out;
+
+        let fan_out_step_key = format!("_fanout:{}", self.key);
+
+        // Check for cached result (replay path).
+        if let Some(cached) = fan_out::check_cached::<T>(self.ctx, &fan_out_step_key)? {
+            return Ok(cached);
+        }
+
+        // No longer replaying.
+        self.ctx
+            .replaying
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let child_ids: Vec<String> = (0..self.items.len())
+            .map(|idx| format!("{}/{}-{idx}", self.ctx.instance_id, self.key))
+            .collect();
+
+        let concurrency = self.concurrency.unwrap_or(self.items.len().max(1));
+
+        // Write manifest for crash recovery.
+        self.write_manifest(&fan_out_step_key, &child_ids)?;
+
+        let closure = std::sync::Arc::new(f);
+        let results = fan_out::run_inline(
+            &self.ctx.shared,
+            &self.ctx.workflow_name,
+            &child_ids,
+            self.items,
+            closure,
+            concurrency,
+        )
+        .await?;
+
+        // Persist the collected results for memoisation.
+        fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
+
+        Ok(results)
+    }
+
+    /// Executes the fan-out using a registered workflow definition.
+    ///
+    /// Each item is serialized as the child workflow's input. The child's
+    /// output type is determined by the [`WorkflowDef`]. Results are
+    /// collected in item order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the child's error if any child fails. Returns
+    /// [`EngineError::WorkflowNotFound`] if the workflow is not registered.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use memable::{Context, EngineError, WorkflowDef};
+    /// # const PROCESS: WorkflowDef<String, String> = WorkflowDef::new("process");
+    /// # async fn wf(ctx: Context) -> Result<(), EngineError> {
+    /// let results: Vec<String> = ctx.fan_out("batch:v1", vec!["a".into(), "b".into()])
+    ///     .workflow(&PROCESS)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn workflow<O>(self, def: &WorkflowDef<I, O>) -> Result<Vec<O>, EngineError>
+    where
+        I: Serialize + DeserializeOwned + Send + 'static,
+        O: Serialize + DeserializeOwned + Send + 'static,
+    {
+        use crate::engine::fan_out;
+
+        let fan_out_step_key = format!("_fanout:{}", self.key);
+
+        if let Some(cached) = fan_out::check_cached::<O>(self.ctx, &fan_out_step_key)? {
+            return Ok(cached);
+        }
+
+        self.ctx
+            .replaying
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let child_workflow_name = def.name().to_string();
+
+        let child_ids: Vec<String> = (0..self.items.len())
+            .map(|idx| format!("{}/{}-{idx}", self.ctx.instance_id, self.key))
+            .collect();
+
+        let concurrency = self.concurrency.unwrap_or(self.items.len().max(1));
+
+        self.write_manifest(&fan_out_step_key, &child_ids)?;
+
+        // Serialize each item as input bytes.
+        let mut items_bytes = Vec::with_capacity(self.items.len());
+        for item in self.items {
+            let data = StepData::Completed {
+                result: item,
+                status: None,
+            };
+            let bytes = serialize_step(&data, "_input")?;
+            items_bytes.push(bytes);
+        }
+
+        let results = fan_out::run_workflow::<O>(
+            &self.ctx.shared,
+            &child_workflow_name,
+            &child_ids,
+            items_bytes,
+            concurrency,
+        )
+        .await?;
+
+        fan_out::write_result(self.ctx, &fan_out_step_key, &results)?;
+
+        Ok(results)
+    }
+
+    fn write_manifest(
+        &self,
+        fan_out_step_key: &str,
+        child_ids: &[String],
+    ) -> Result<(), EngineError> {
+        let manifest_step_key = fan_out_step_key.replace("_fanout:", "_fanout_manifest:");
+        let manifest = crate::engine::fan_out::FanOutManifest {
+            child_instance_ids: child_ids.to_vec(),
+            count: child_ids.len(),
+        };
+        let manifest_data = StepData::Completed {
+            result: manifest,
+            status: None,
+        };
+        let manifest_composite = format!(
+            "{}/{}/{}",
+            self.ctx.workflow_name, self.ctx.instance_id, manifest_step_key
+        );
+        let manifest_bytes = serialize_step(&manifest_data, &manifest_step_key)?;
+        self.ctx.write_step(&manifest_composite, &manifest_bytes)
     }
 }

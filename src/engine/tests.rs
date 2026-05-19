@@ -3436,3 +3436,331 @@ async fn spawn_child_from_context() {
         .await
         .unwrap_completed();
 }
+
+// ── Phase 4: Fan-out tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn fan_out_basic_inline() {
+    const PARENT: WorkflowDef<(), Vec<String>> = WorkflowDef::new("fan-parent");
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, |ctx: Context| async move {
+        let items = vec!["hello".to_string(), "world".to_string(), "test".to_string()];
+        let results: Vec<String> = ctx
+            .fan_out("upper:v1", items)
+            .run(|child_ctx, item| async move {
+                let upper: String = child_ctx
+                    .step("process:v1")
+                    .run(async move || Ok(item.to_uppercase()))
+                    .await?;
+                Ok(upper)
+            })
+            .await?;
+        assert_eq!(results, vec!["HELLO", "WORLD", "TEST"]);
+        Ok(results)
+    });
+    engine.start().await.unwrap();
+
+    let completed = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+    let output: Vec<String> = completed.output().unwrap();
+    assert_eq!(output, vec!["HELLO", "WORLD", "TEST"]);
+}
+
+#[tokio::test]
+async fn fan_out_concurrency_respected() {
+    const PARENT: WorkflowDef = WorkflowDef::new("fan-conc");
+
+    let max_concurrent = Arc::new(AtomicU32::new(0));
+    let current = Arc::new(AtomicU32::new(0));
+    let mc = Arc::clone(&max_concurrent);
+    let cc = Arc::clone(&current);
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, move |ctx: Context| {
+        let mc = Arc::clone(&mc);
+        let cc = Arc::clone(&cc);
+        async move {
+            let items: Vec<i32> = (0..6).collect();
+            let _: Vec<i32> = ctx
+                .fan_out("work:v1", items)
+                .concurrency(2)
+                .run(move |child_ctx, item| {
+                    let mc = Arc::clone(&mc);
+                    let cc = Arc::clone(&cc);
+                    async move {
+                        let prev = cc.fetch_add(1, Ordering::SeqCst);
+                        mc.fetch_max(prev + 1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        cc.fetch_sub(1, Ordering::SeqCst);
+                        let val: i32 = child_ctx.step("id:v1").run(async move || Ok(item)).await?;
+                        Ok(val)
+                    }
+                })
+                .await?;
+            Ok(())
+        }
+    });
+    engine.start().await.unwrap();
+
+    let _ = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+
+    assert!(
+        max_concurrent.load(Ordering::SeqCst) <= 2,
+        "max concurrent was {}, expected <= 2",
+        max_concurrent.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn fan_out_parent_suspended() {
+    const PARENT: WorkflowDef = WorkflowDef::new("fan-suspend");
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel::<()>();
+    let ready_tx = Arc::new(tokio::sync::Mutex::new(Some(ready_tx)));
+    let proceed_rx = Arc::new(tokio::sync::Mutex::new(Some(proceed_rx)));
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, move |ctx: Context| {
+        let ready_tx = Arc::clone(&ready_tx);
+        let proceed_rx = Arc::clone(&proceed_rx);
+        async move {
+            let items = vec![1];
+            let _: Vec<i32> = ctx
+                .fan_out("wait:v1", items)
+                .run(move |_child_ctx, item| {
+                    let ready_tx = Arc::clone(&ready_tx);
+                    let proceed_rx = Arc::clone(&proceed_rx);
+                    async move {
+                        if let Some(tx) = ready_tx.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = proceed_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok(item)
+                    }
+                })
+                .await?;
+            Ok(())
+        }
+    });
+    engine.start().await.unwrap();
+
+    let mut inv = engine.invoke(&PARENT).await.unwrap();
+    let instance_id = inv.instance_id().to_string();
+
+    // Wait until the child signals it's running.
+    ready_rx.await.unwrap();
+
+    // Parent task is still alive while child runs (not Suspended, not terminal).
+    let state = engine.state(&PARENT, &instance_id).unwrap();
+    assert!(
+        !state.is_terminal(),
+        "expected non-terminal while child runs, got {state:?}"
+    );
+
+    // Let the child finish.
+    let _ = proceed_tx.send(());
+
+    // Wait for parent to complete.
+    loop {
+        let state = inv.status().borrow().clone();
+        if state.is_terminal() {
+            break;
+        }
+        if inv.status().changed().await.is_err() {
+            break;
+        }
+    }
+
+    assert!(inv.status().borrow().is_terminal());
+}
+
+#[tokio::test]
+async fn fan_out_results_memoised() {
+    const PARENT: WorkflowDef<(), Vec<i32>> = WorkflowDef::new("fan-memo");
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let cc = Arc::clone(&call_count);
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, move |ctx: Context| {
+        let cc = Arc::clone(&cc);
+        async move {
+            let items = vec![10, 20, 30];
+            let results: Vec<i32> = ctx
+                .fan_out("calc:v1", items)
+                .run(move |child_ctx, item| {
+                    let cc = Arc::clone(&cc);
+                    async move {
+                        cc.fetch_add(1, Ordering::Relaxed);
+                        let val: i32 = child_ctx
+                            .step("double:v1")
+                            .run(async move || Ok(item * 2))
+                            .await?;
+                        Ok(val)
+                    }
+                })
+                .await?;
+            Ok(results)
+        }
+    });
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke(&PARENT).await.unwrap();
+    let instance_id = inv.instance_id().to_string();
+    let completed = inv.wait().await.unwrap_completed();
+    let output: Vec<i32> = completed.output().unwrap();
+    assert_eq!(output, vec![20, 40, 60]);
+    assert_eq!(call_count.load(Ordering::Relaxed), 3);
+
+    // Resume — fan-out should return cached results.
+    call_count.store(0, Ordering::Relaxed);
+    let completed = engine
+        .resume(&PARENT, &instance_id)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+    let output: Vec<i32> = completed.output().unwrap();
+    assert_eq!(output, vec![20, 40, 60]);
+    assert_eq!(call_count.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn fan_out_empty_items() {
+    const PARENT: WorkflowDef<(), Vec<i32>> = WorkflowDef::new("fan-empty");
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, |ctx: Context| async move {
+        let items: Vec<i32> = vec![];
+        let results: Vec<i32> = ctx
+            .fan_out("noop:v1", items)
+            .run(|_child_ctx, item| async move { Ok(item) })
+            .await?;
+        assert!(results.is_empty());
+        Ok(results)
+    });
+    engine.start().await.unwrap();
+
+    let completed = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+    let output: Vec<i32> = completed.output().unwrap();
+    assert!(output.is_empty());
+}
+
+#[tokio::test]
+async fn fan_out_child_failure_aborts_remaining() {
+    const PARENT: WorkflowDef = WorkflowDef::new("fan-fail");
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, |ctx: Context| async move {
+        let items = vec![1, 2, 3];
+        let _: Vec<i32> = ctx
+            .fan_out("fail:v1", items)
+            .concurrency(1)
+            .run(|child_ctx, item| async move {
+                if item == 2 {
+                    return Err(EngineError::step_failed("boom", "child 2 failed", false));
+                }
+                let val: i32 = child_ctx.step("id:v1").run(async move || Ok(item)).await?;
+                Ok(val)
+            })
+            .await?;
+        Ok(())
+    });
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke(&PARENT).await.unwrap();
+    let result = inv.wait().await;
+    assert!(result.is_failed(), "expected Failed, got {result}");
+}
+
+#[tokio::test]
+async fn fan_out_child_metadata_written() {
+    const PARENT: WorkflowDef = WorkflowDef::new("fan-meta");
+
+    let mut engine = test_engine();
+    engine.register(&PARENT, |ctx: Context| async move {
+        let items = vec!["a".to_string(), "b".to_string()];
+        let _: Vec<String> = ctx
+            .fan_out("meta:v1", items)
+            .run(|child_ctx, item| async move {
+                let val: String = child_ctx
+                    .step("echo:v1")
+                    .run(async move || Ok(item.clone()))
+                    .await?;
+                Ok(val)
+            })
+            .await?;
+        Ok(())
+    });
+    engine.start().await.unwrap();
+
+    let inv = engine.invoke(&PARENT).await.unwrap();
+    let parent_id = inv.instance_id().to_string();
+    let _ = inv.wait().await.unwrap_completed();
+
+    // Children should have metadata entries.
+    let all = engine.list_instances(&PARENT).unwrap();
+    let child_ids: Vec<String> = all
+        .iter()
+        .filter(|(id, _)| id.starts_with(&format!("{parent_id}/")))
+        .map(|(id, _)| id.clone())
+        .collect();
+    assert_eq!(child_ids.len(), 2);
+
+    for (_, meta) in &all {
+        if matches!(meta.status(), MetadataStatus::Running) {
+            panic!("child metadata should not be Running after completion");
+        }
+    }
+}
+
+#[tokio::test]
+async fn fan_out_registered_workflow() {
+    const PARENT: WorkflowDef<(), Vec<String>> = WorkflowDef::new("fan-reg-parent");
+    const CHILD: WorkflowDef<String, String> = WorkflowDef::new("fan-reg-child");
+
+    async fn child_wf(_ctx: Context, input: String) -> Result<String, EngineError> {
+        Ok(format!("processed:{input}"))
+    }
+
+    let mut engine = test_engine();
+    engine.register(&CHILD, child_wf);
+    engine.register(&PARENT, |ctx: Context| async move {
+        let items = vec!["x".to_string(), "y".to_string()];
+        let results: Vec<String> = ctx.fan_out("reg:v1", items).workflow(&CHILD).await?;
+        Ok(results)
+    });
+    engine.start().await.unwrap();
+
+    let completed = engine
+        .invoke(&PARENT)
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_completed();
+    let output: Vec<String> = completed.output().unwrap();
+    assert_eq!(output, vec!["processed:x", "processed:y"]);
+}

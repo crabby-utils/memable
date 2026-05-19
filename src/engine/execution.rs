@@ -15,7 +15,7 @@ use crate::context::{
 use crate::error::EngineError;
 use crate::metadata::{self, MetadataStatus, WORKFLOW_META, WorkflowMetadata};
 
-pub(super) fn validate_key_component(value: &str, label: &'static str) -> Result<(), EngineError> {
+pub(crate) fn validate_key_component(value: &str, label: &'static str) -> Result<(), EngineError> {
     if value.contains('/') {
         return Err(EngineError::InvalidKey {
             label,
@@ -25,7 +25,7 @@ pub(super) fn validate_key_component(value: &str, label: &'static str) -> Result
     Ok(())
 }
 
-pub(super) fn generate_instance_id() -> String {
+pub(crate) fn generate_instance_id() -> String {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -34,7 +34,7 @@ pub(super) fn generate_instance_id() -> String {
     format!("{ts}-{rand:x}")
 }
 
-pub(super) fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -44,7 +44,7 @@ pub(super) fn now_unix_millis() -> u64 {
     .expect("system clock overflows u64 millis")
 }
 
-pub(super) fn handle_workflow_result(
+pub(crate) fn handle_workflow_result(
     result: Result<(), EngineError>,
     db: &Database,
     workflow_name: &str,
@@ -98,7 +98,7 @@ pub(super) fn handle_workflow_result(
     }
 }
 
-pub(super) fn spawn_workflow_task(
+pub(crate) fn spawn_workflow_task(
     tasks: &mut tokio::task::JoinSet<()>,
     shared: &Arc<EngineShared>,
     workflow: &WorkflowFn,
@@ -138,7 +138,7 @@ pub(super) fn spawn_workflow_task(
     );
 }
 
-pub(super) fn claim_suspended_step(
+pub(crate) fn claim_suspended_step(
     db: &Database,
     workflow_name: &str,
     instance_id: &str,
@@ -209,7 +209,7 @@ pub(super) fn claim_suspended_step(
     Ok(())
 }
 
-pub(super) async fn poll_timers(shared: &Arc<EngineShared>) -> Result<(), EngineError> {
+pub(crate) async fn poll_timers(shared: &Arc<EngineShared>) -> Result<(), EngineError> {
     let now = now_unix_millis();
     let expired = collect_expired_timers(&shared.db, now)?;
 

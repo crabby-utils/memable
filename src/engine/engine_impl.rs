@@ -849,7 +849,7 @@ impl Engine {
         })
     }
 
-    fn get_or_create_sender(
+    pub(crate) fn get_or_create_sender(
         senders: &super::Senders,
         instance_id: &str,
     ) -> watch::Sender<WorkflowState> {
